@@ -79,13 +79,19 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      # Privaten Quellcode per read-only Deploy-Key auschecken (statt des eigenen
-      # echo-releases-Repos). Genau der Tag, der gebaut werden soll.
+      # Privaten Quellcode auschecken (statt des eigenen echo-releases-Repos), genau
+      # den zu bauenden Tag. HTTPS-Token statt SSH-Deploy-Key: der SSH-Weg klemmt auf
+      # dem windows-11-arm-Runner (Permission denied publickey), Token ist plattform-
+      # einheitlich. `persist-credentials: false` -> der Token lebt NUR im Checkout-
+      # Schritt, landet nicht in der git-config fuer npm/cargo (Supply-Chain).
       - uses: actions/checkout@v4
         with:
           repository: subunit-ai/echo-tauri
           ref: ${{ needs.prepare.outputs.ref }}
-          ssh-key: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
+          # TODO Härtung: dedizierten fein-granularen READ-ONLY-PAT (nur echo-tauri
+          # Contents:read) als eigenes Secret nutzen. Vorerst RELEASES_TOKEN, dessen
+          # echo-tauri-Lesezugriff dieser Lauf gleich mit-beweist.
+          token: ${{ secrets.RELEASES_TOKEN }}
           persist-credentials: false
 
       - name: Install Linux deps
