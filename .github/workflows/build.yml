@@ -88,10 +88,11 @@ jobs:
         with:
           repository: subunit-ai/echo-tauri
           ref: ${{ needs.prepare.outputs.ref }}
-          # TODO Härtung: dedizierten fein-granularen READ-ONLY-PAT (nur echo-tauri
-          # Contents:read) als eigenes Secret nutzen. Vorerst RELEASES_TOKEN, dessen
-          # echo-tauri-Lesezugriff dieser Lauf gleich mit-beweist.
-          token: ${{ secrets.RELEASES_TOKEN }}
+          # Fein-granularer READ-ONLY-PAT, nur echo-tauri Contents:read. Bewusst NICHT
+          # RELEASES_TOKEN (kann echo-tauri gar nicht lesen — verifiziert) und NICHT der
+          # SSH-Deploy-Key (bricht auf windows-11-arm). persist-credentials:false haelt
+          # den Token auf den Checkout-Schritt begrenzt (nicht in git-config fuer npm/cargo).
+          token: ${{ secrets.ECHO_TAURI_READ_TOKEN }}
           persist-credentials: false
 
       - name: Install Linux deps
