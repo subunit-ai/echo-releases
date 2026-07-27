@@ -241,7 +241,6 @@ jobs:
           set -euo pipefail
           tag="${{ needs.prepare.outputs.tag }}"
           repo="${{ github.repository }}"
-          ver="${tag#v}"
           now="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
           base_url="https://github.com/$repo/releases/download/$tag"
 
@@ -250,18 +249,24 @@ jobs:
           id=$(echo "$rel" | jq -r '.id // empty')
           if [ -z "$id" ]; then echo "::error::no release found for $tag"; exit 1; fi
 
-          mac="echo_aarch64.app.tar.gz"
-          lin="echo_${ver}_amd64.AppImage"
-          win64="echo_${ver}_x64-setup.exe"
-          winarm="echo_${ver}_arm64-setup.exe"
-
+          # Dateinamen aus den ECHTEN Assets ableiten (nicht aus dem Tag): der
+          # Installer-Name traegt die App-Version, die bei echten Releases == Tag ist,
+          # bei Test-Tags (…-citest) aber abweicht. So bricht Publish nie am Tag, und
+          # die Manifest-Version stammt garantiert vom gebauten Artefakt.
           assets=$(echo "$rel" | jq -r '.assets[].name')
           have() { echo "$assets" | grep -qx "$1"; }
+          mac="echo_aarch64.app.tar.gz"
+          lin=$(echo "$assets"   | grep -E '^echo_.+_amd64\.AppImage$'  | head -1 || true)
+          win64=$(echo "$assets" | grep -E '^echo_.+_x64-setup\.exe$'   | head -1 || true)
+          winarm=$(echo "$assets"| grep -E '^echo_.+_arm64-setup\.exe$' | head -1 || true)
           missing=""
-          for f in "$mac" "$lin" "$win64" "$winarm"; do
+          for pair in "macOS=$mac" "Linux=$lin" "Win-x64=$win64" "Win-ARM=$winarm"; do
+            lbl="${pair%%=*}"; f="${pair#*=}"
+            if [ -z "$f" ]; then missing="$missing ${lbl}-installer"; continue; fi
             have "$f"     || missing="$missing $f"
             have "$f.sig" || missing="$missing $f.sig"
           done
+          ver=$(printf '%s' "$lin" | sed -E 's/^echo_(.+)_amd64\.AppImage$/\1/')
           if [ -n "$missing" ]; then
             echo "::error::latest.json would be incomplete — missing:$missing"
             echo "::error::leaving draft hidden; rerun the failed build job(s)."
