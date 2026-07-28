@@ -1,0 +1,340 @@
+name: build
+
+# Baut + signiert Echo für alle Plattformen und published das Release HIER (public
+# echo-releases) — der Quellcode liegt PRIVAT in subunit-ai/echo-tauri und wird per
+# fein-granularem READ-ONLY-PAT (Secret ECHO_TAURI_READ_TOKEN) ausgecheckt. Weil der
+# Build in einem PUBLIC Repo läuft, sind die Runner-Minuten GRATIS (auch macOS +
+# windows-11-arm) → KEIN Billing. Genau darum liegt der Build hier statt im privaten
+# echo-tauri: dort würden private-Repo-Minuten anfallen. [[repo-public-only-for-ci]]
+#
+# Anstoß auf DREI Wegen (bewusst KEIN Trigger im privaten Repo — das bräuchte
+# private Minuten):
+#   • schedule (Poller) — prüft alle 15 min, ob echo-tauri einen neuen Versions-Tag
+#     hat, der hier noch kein published Release ist, und baut ihn. So bleibt TJs
+#     Ablauf „Version taggen + pushen" unverändert, ohne dass echo-tauri eine Action
+#     laufen lassen muss.
+#   • workflow_dispatch — sofortiger manueller Lauf (Quell-Ref + optionales Label).
+#   • repository_dispatch (type: build-release) — für externe Auslöser.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "echo-tauri Tag/Ref zum Bauen (z. B. v0.5.154)"
+        required: true
+      release_tag:
+        description: "Release-Label hier in echo-releases (leer = wie source_ref)"
+        required: false
+  repository_dispatch:
+    types: [build-release]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  SOURCE_REPO: subunit-ai/echo-tauri
+
+jobs:
+  # Ref (Quelle) + Tag (Release-Label) EINMAL bestimmen und streng validieren.
+  # Beim Poller (schedule): neuesten Versions-Tag aus dem PRIVATEN echo-tauri holen
+  # und nur bauen, wenn hier noch kein published Release dafür existiert. Sonst:
+  # expliziter Ref aus dispatch/input. Nur vX.Y.Z(-suffix) wird durchgelassen
+  # (kein Branch, keine Shell-Metazeichen → keine Injection). should_build=false
+  # überspringt die Build-/Publish-Jobs (Poller ohne neue Version = No-op).
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+      tag: ${{ steps.pick.outputs.tag }}
+      should_build: ${{ steps.pick.outputs.should_build }}
+    steps:
+      - id: pick
+        env:
+          EV: ${{ github.event_name }}
+          DISPATCH_REF: ${{ github.event.client_payload.ref }}
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          INPUT_REF: ${{ github.event.inputs.source_ref }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+          READ_TOKEN: ${{ secrets.ECHO_TAURI_READ_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          if [ "$EV" = "schedule" ]; then
+            # Neuesten Versions-Tag aus dem privaten echo-tauri (READ_TOKEN liest Refs).
+            tags=$(GH_TOKEN="$READ_TOKEN" gh api "repos/$SOURCE_REPO/git/refs/tags" \
+                     --paginate --jq '.[].ref' 2>/dev/null | sed 's#refs/tags/##' || true)
+            ref=$(printf '%s\n' "$tags" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+            if [ -z "$ref" ]; then
+              echo "keine Versions-Tags gefunden"; echo "should_build=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            # Schon als NICHT-Draft-Release hier vorhanden? Dann nichts zu tun.
+            if [ "$(gh release view "$ref" -R "$THIS_REPO" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)" = "false" ]; then
+              echo "$ref ist bereits published — No-op"; echo "should_build=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            tag="$ref"; echo "neuer Tag $ref → wird gebaut"
+          elif [ "$EV" = "repository_dispatch" ]; then
+            ref="$DISPATCH_REF"; tag="${DISPATCH_TAG:-$DISPATCH_REF}"
+          else
+            ref="$INPUT_REF"; tag="${INPUT_TAG:-$INPUT_REF}"
+          fi
+          # Nur Versions-Tags: vX.Y.Z mit optionalem -suffix (z. B. -citest).
+          re='^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$'
+          echo "$ref" | grep -Eq "$re" || { echo "::error::ungültiger ref: $ref"; exit 1; }
+          echo "$tag" | grep -Eq "$re" || { echo "::error::ungültiger tag: $tag"; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "Quelle $SOURCE_REPO@$ref  →  Release $tag"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-24.04
+            args: "--features local-whisper-gpu"
+          - platform: windows-latest
+            args: "--features local-whisper-gpu"
+          - platform: windows-11-arm
+            args: "--features local-meet"
+          - platform: macos-14
+            args: "--target aarch64-apple-darwin --features local-meet"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      # Privaten Quellcode auschecken (statt des eigenen echo-releases-Repos), genau
+      # den zu bauenden Tag. HTTPS-Token statt SSH-Deploy-Key: der SSH-Weg klemmt auf
+      # dem windows-11-arm-Runner (Permission denied publickey), Token ist plattform-
+      # einheitlich. `persist-credentials: false` -> der Token lebt NUR im Checkout-
+      # Schritt, landet nicht in der git-config fuer npm/cargo (Supply-Chain).
+      - uses: actions/checkout@v4
+        with:
+          repository: subunit-ai/echo-tauri
+          ref: ${{ needs.prepare.outputs.ref }}
+          # Fein-granularer READ-ONLY-PAT, nur echo-tauri Contents:read. Bewusst NICHT
+          # RELEASES_TOKEN (kann echo-tauri gar nicht lesen — verifiziert) und NICHT der
+          # SSH-Deploy-Key (bricht auf windows-11-arm). persist-credentials:false haelt
+          # den Token auf den Checkout-Schritt begrenzt (nicht in git-config fuer npm/cargo).
+          token: ${{ secrets.ECHO_TAURI_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Install Linux deps
+        if: matrix.platform == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev \
+            libasound2-dev libxdo-dev libssl-dev patchelf \
+            build-essential clang libclang-dev cmake \
+            libvulkan-dev glslc
+          echo "VULKAN_SDK=/usr" >> "$GITHUB_ENV"
+
+      - name: LLVM x64 + CMake + Ninja (Windows x64)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install llvm cmake ninja --no-progress -y --installargs 'ADD_CMAKE_TO_PATH=System'
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Vulkan SDK (Windows x64, GPU whisper — keep glslc for shader gen)
+        if: matrix.platform == 'windows-latest'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.3.290.0
+          install_runtime: true
+          cache: true
+          stripdown: false
+
+      - name: glslc on PATH (Windows x64)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: '"$env:VULKAN_SDK\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
+
+      - name: MSVC env (Windows x64 — Ninja needs cl + INCLUDE/LIB in the job env)
+        if: matrix.platform == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: ARM64 LLVM + CMake + Ninja (Windows ARM — choco LLVM is x64)
+        if: matrix.platform == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/LLVM-19.1.5-woa64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm-arm64.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\llvm-arm64.exe" -ArgumentList '/S' -Wait
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          choco install cmake ninja --no-progress -y --installargs 'ADD_CMAKE_TO_PATH=System'
+          "C:\Program Files\CMake\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CC=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CXX=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CXXFLAGS=/EHsc" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GGML_CPU_AARCH64=OFF" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GGML_CPU_REPACK=OFF" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: MSVC env for clang-cl (Windows ARM — INCLUDE/LIB for the ARM64 MSVC CRT)
+        if: matrix.platform == 'windows-11-arm'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: macOS build env (cmake + deployment target for whisper.cpp std::filesystem)
+        if: matrix.platform == 'macos-14'
+        run: |
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+          echo "CMAKE_OSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - run: npm ci
+
+      - name: macOS signing keychain (stable self-signed cert — keeps TCC grants across updates)
+        if: matrix.platform == 'macos-14'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "no signing cert configured — staying ad-hoc"; exit 0
+          fi
+          echo "$APPLE_CERTIFICATE" | base64 -d > /tmp/echo-sign.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security import /tmp/echo-sign.p12 -k build.keychain \
+            -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k ci build.keychain > /dev/null
+          security find-certificate -c "$APPLE_SIGNING_IDENTITY" -p build.keychain > /tmp/echo-sign.pem
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain /tmp/echo-sign.pem
+          rm /tmp/echo-sign.p12
+          echo "valid codesigning identities now:"
+          security find-identity -v -p codesigning build.keychain
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          ECHO_SENTRY_DSN: ${{ secrets.ECHO_SENTRY_DSN }}
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        with:
+          # Der Draft wird HIER (echo-releases) angelegt — kein Mirror mehr nötig,
+          # weil der Build direkt im Distributions-Repo läuft.
+          tagName: ${{ needs.prepare.outputs.tag }}
+          releaseName: "Echo ${{ needs.prepare.outputs.tag }}"
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+  publish:
+    # Atomar: Draft erst public schalten, wenn ALLE Plattformen + eine VOLLSTÄNDIGE
+    # latest.json da sind. Der Draft liegt bereits in echo-releases — die latest.json
+    # wird deterministisch aus den .sig-Assets zusammengesetzt (signature = .sig-Inhalt
+    # VERBATIM, nicht neu enkodieren), und wir verweigern das Publish bei fehlender
+    # Plattform. Kein zweites Repo, kein Mirror.
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Assemble + validate latest.json, publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.prepare.outputs.tag }}"
+          repo="${{ github.repository }}"
+          now="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+          base_url="https://github.com/$repo/releases/download/$tag"
+
+          rel=$(gh api "repos/$repo/releases?per_page=30" \
+            --jq "[.[] | select(.tag_name==\"$tag\")][0]")
+          id=$(echo "$rel" | jq -r '.id // empty')
+          if [ -z "$id" ]; then echo "::error::no release found for $tag"; exit 1; fi
+
+          # Dateinamen aus den ECHTEN Assets ableiten (nicht aus dem Tag): der
+          # Installer-Name traegt die App-Version, die bei echten Releases == Tag ist,
+          # bei Test-Tags (…-citest) aber abweicht. So bricht Publish nie am Tag, und
+          # die Manifest-Version stammt garantiert vom gebauten Artefakt.
+          assets=$(echo "$rel" | jq -r '.assets[].name')
+          have() { echo "$assets" | grep -qx "$1"; }
+          mac="echo_aarch64.app.tar.gz"
+          lin=$(echo "$assets"   | grep -E '^echo_.+_amd64\.AppImage$'  | head -1 || true)
+          win64=$(echo "$assets" | grep -E '^echo_.+_x64-setup\.exe$'   | head -1 || true)
+          winarm=$(echo "$assets"| grep -E '^echo_.+_arm64-setup\.exe$' | head -1 || true)
+          missing=""
+          for pair in "macOS=$mac" "Linux=$lin" "Win-x64=$win64" "Win-ARM=$winarm"; do
+            lbl="${pair%%=*}"; f="${pair#*=}"
+            if [ -z "$f" ]; then missing="$missing ${lbl}-installer"; continue; fi
+            have "$f"     || missing="$missing $f"
+            have "$f.sig" || missing="$missing $f.sig"
+          done
+          ver=$(printf '%s' "$lin" | sed -E 's/^echo_(.+)_amd64\.AppImage$/\1/')
+          if [ -n "$missing" ]; then
+            echo "::error::latest.json would be incomplete — missing:$missing"
+            echo "::error::leaving draft hidden; rerun the failed build job(s)."
+            exit 1
+          fi
+
+          for f in "$mac" "$lin" "$win64" "$winarm"; do
+            gh release download "$tag" -R "$repo" -p "$f.sig" -O "/tmp/$f.sig" --clobber
+          done
+
+          cat > /tmp/mkmanifest.py <<'PY'
+          import sys, json
+          ver, now, base = sys.argv[1], sys.argv[2], sys.argv[3]
+          mac, lin, win64, winarm = sys.argv[4:8]
+          def sig(name):
+              with open(f"/tmp/{name}.sig", "r", encoding="utf-8") as fh:
+                  return fh.read().strip()
+          def url(name): return f"{base}/{name}"
+          plats = {}
+          for k in ("darwin-aarch64", "darwin-aarch64-app"):
+              plats[k] = {"signature": sig(mac), "url": url(mac)}
+          for k in ("linux-x86_64", "linux-x86_64-appimage"):
+              plats[k] = {"signature": sig(lin), "url": url(lin)}
+          for k in ("windows-x86_64", "windows-x86_64-nsis"):
+              plats[k] = {"signature": sig(win64), "url": url(win64)}
+          for k in ("windows-aarch64", "windows-aarch64-nsis"):
+              plats[k] = {"signature": sig(winarm), "url": url(winarm)}
+          json.dump({"version": ver, "notes": "", "pub_date": now,
+                     "platforms": plats}, sys.stdout, indent=2)
+          PY
+
+          python3 /tmp/mkmanifest.py "$ver" "$now" "$base_url" \
+            "$mac" "$lin" "$win64" "$winarm" > /tmp/latest.json
+          for k in darwin-aarch64 linux-x86_64 windows-x86_64 windows-aarch64; do
+            jq -e ".platforms[\"$k\"].url" /tmp/latest.json >/dev/null \
+              || { echo "::error::latest.json missing $k"; exit 1; }
+          done
+          echo "manifest platforms:"; jq '.platforms | keys' /tmp/latest.json
+
+          gh release upload "$tag" -R "$repo" /tmp/latest.json --clobber
+          gh api -X PATCH "repos/$repo/releases/$id" \
+            -F draft=false -f make_latest=true > /dev/null
+          echo "published $tag (release $id) on $repo"
