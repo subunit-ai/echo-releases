@@ -2,7 +2,7 @@ name: build
 
 # Baut + signiert Echo für alle Plattformen und published das Release HIER (public
 # echo-releases) — der Quellcode liegt PRIVAT in subunit-ai/echo-tauri und wird per
-# fein-granularem READ-ONLY-PAT (Secret ECHO_TAURI_READ_TOKEN) ausgecheckt. Weil der
+# read-only Deploy-Key (Secret ECHO_TAURI_DEPLOY_KEY) ausgecheckt. Weil der
 # Build in einem PUBLIC Repo läuft, sind die Runner-Minuten GRATIS (auch macOS +
 # windows-11-arm) → KEIN Billing. Genau darum liegt der Build hier statt im privaten
 # echo-tauri: dort würden private-Repo-Minuten anfallen. [[repo-public-only-for-ci]]
@@ -54,16 +54,19 @@ jobs:
           DISPATCH_TAG: ${{ github.event.client_payload.tag }}
           INPUT_REF: ${{ github.event.inputs.source_ref }}
           INPUT_TAG: ${{ github.event.inputs.release_tag }}
-          READ_TOKEN: ${{ secrets.ECHO_TAURI_READ_TOKEN }}
+          DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           THIS_REPO: ${{ github.repository }}
         run: |
           set -eu
           if [ "$EV" = "schedule" ]; then
-            # Neuesten Versions-Tag aus dem privaten echo-tauri (READ_TOKEN liest Refs).
-            tags=$(GH_TOKEN="$READ_TOKEN" gh api "repos/$SOURCE_REPO/git/refs/tags" \
-                     --paginate --jq '.[].ref' 2>/dev/null | sed 's#refs/tags/##' || true)
-            ref=$(printf '%s\n' "$tags" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+            # Neuesten Versions-Tag aus dem privaten echo-tauri holen — via git ls-remote
+            # mit dem read-only Deploy-Key (kein PAT nötig; SSH-Git-Zugriff genügt).
+            mkdir -p ~/.ssh && printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/echo_ci && chmod 600 ~/.ssh/echo_ci
+            export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
+            ref=$(git ls-remote --tags --refs "git@github.com:$SOURCE_REPO.git" 'v*' 2>/dev/null \
+                    | awk -F/ '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+            rm -f ~/.ssh/echo_ci
             if [ -z "$ref" ]; then
               echo "keine Versions-Tags gefunden"; echo "should_build=false" >> "$GITHUB_OUTPUT"; exit 0
             fi
@@ -106,21 +109,26 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      # Privaten Quellcode auschecken (statt des eigenen echo-releases-Repos), genau
-      # den zu bauenden Tag. HTTPS-Token statt SSH-Deploy-Key: der SSH-Weg klemmt auf
-      # dem windows-11-arm-Runner (Permission denied publickey), Token ist plattform-
-      # einheitlich. `persist-credentials: false` -> der Token lebt NUR im Checkout-
-      # Schritt, landet nicht in der git-config fuer npm/cargo (Supply-Chain).
-      - uses: actions/checkout@v4
-        with:
-          repository: subunit-ai/echo-tauri
-          ref: ${{ needs.prepare.outputs.ref }}
-          # Fein-granularer READ-ONLY-PAT, nur echo-tauri Contents:read. Bewusst NICHT
-          # RELEASES_TOKEN (kann echo-tauri gar nicht lesen — verifiziert) und NICHT der
-          # SSH-Deploy-Key (bricht auf windows-11-arm). persist-credentials:false haelt
-          # den Token auf den Checkout-Schritt begrenzt (nicht in git-config fuer npm/cargo).
-          token: ${{ secrets.ECHO_TAURI_READ_TOKEN }}
-          persist-credentials: false
+      # Privaten Quellcode (echo-tauri@ref) auschecken — MANUELLER git clone per
+      # read-only Deploy-Key, NICHT actions/checkout mit ssh-key: dessen SSH-Handling
+      # bricht auf windows-11-arm (Permission denied publickey). Der manuelle Weg
+      # nutzt auf allen Plattformen git-bashs OpenSSH einheitlich. Kein PAT nötig →
+      # der Nutzer muss nichts anlegen. Schlüssel wird nach dem Clone sofort gelöscht
+      # und liegt nicht in der git-config (kein Zugriff für npm/cargo).
+      - name: Checkout private source (deploy key)
+        shell: bash
+        env:
+          DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
+          REF: ${{ needs.prepare.outputs.ref }}
+        run: |
+          set -eu
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/echo_ci
+          chmod 600 ~/.ssh/echo_ci
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 --branch "$REF" "git@github.com:subunit-ai/echo-tauri.git" .
+          git config --unset-all core.sshCommand 2>/dev/null || true
+          rm -f ~/.ssh/echo_ci
 
       - name: Install Linux deps
         if: matrix.platform == 'ubuntu-24.04'
