@@ -1,0 +1,171 @@
+# Echo — PR-Check (tsc + vite + cargo check + cargo test) für das PRIVATE Quell-Repo.
+#
+# WARUM hier (im PUBLIC echo-releases) statt im privaten echo-tauri:
+# GitHub rechnet Actions-Minuten nach dem Repo ab, in dem der Workflow LÄUFT.
+# `echo-tauri` ist privat → seine Jobs hängen an der Org-Billing-Sperre (zuletzt
+# 2026-08-06: dispatchte pr-/win-check-Runs bekamen 15 min lang KEINEN Runner
+# — runner_name leer, 0 Steps — und wurden dann abgebrochen; PR #142 wurde drei
+# Minuten später ungeprüft gemerged). `echo-releases` ist public → Minuten GRATIS.
+# Der Quellcode wird per read-only Deploy-Key ausgecheckt (Muster: build.yml).
+#
+# ZWEITER GRUND — im privaten echo-tauri ist ein ECHTES Gate technisch unmöglich:
+# Branch-Protection und Rulesets sind auf dem aktuellen Plan für private Repos
+# gesperrt (API: 403 "Upgrade to GitHub Pro or make this repository public").
+# Ein Check dort kann also NIE "required" sein. Der einzige wirksame Riegel ist
+# darum client-seitig: ship.sh startet DIESEN Lauf und merged nur bei grün.
+#
+# SICHERHEIT: Trigger ist AUSSCHLIESSLICH workflow_dispatch — Forks können den
+# Workflow nicht mit unseren Secrets starten. Nur wer Schreibrechte auf DIESES
+# Repo hat, kann ihn auslösen. Der Job zieht KEINE Signing-/Sentry-Secrets, nur
+# den read-only Deploy-Key; keine Artefakte, keine Logs mit Kundendaten
+# (die Biometrie-Fixtures liegen gitignored unter fixtures/private/ und die
+# zugehörigen Tests skippen, wenn sie fehlen — im Repo ist KEIN Fixture getrackt).
+#
+# AUSGELÖST VON: scripts/session/ship.sh im Quell-Repo (vor dem Squash-Merge):
+#   gh workflow run pr-check.yml -R subunit-ai/echo-releases -f ref=<branch>
+# ship.sh wartet auf die Conclusion dieses Runs und merged nur bei grün.
+
+name: PR Check (Quell-Repo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/Tag im privaten echo-tauri (z. B. fix/chart-text-squeeze)"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-check-${{ inputs.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: subunit-ai/echo-tauri
+
+jobs:
+  # ── Linux-Gate: Frontend-Build + cargo check + cargo test ───────────────────
+  # Spiegelt echo-tauri/.github/workflows/pr-check.yml. Default-Features ziehen
+  # kein whisper-rs-sys → kein cmake/LLVM nötig, darum schnell (~3–4 min).
+  linux:
+    name: tsc + vite + cargo check + test
+    runs-on: ubuntu-latest
+    steps:
+      # Manueller git clone statt actions/checkout+ssh-key: identisch zu build.yml,
+      # Ref + Key über env (nicht inline) → keine Shell-Injection. Der Schlüssel
+      # wird direkt nach dem Clone gelöscht und landet nicht in der git-config.
+      - name: Quellcode auschecken (privat, read-only Deploy-Key)
+        shell: bash
+        env:
+          SRC_REF: ${{ inputs.ref }}
+          DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/echo_ci"
+          chmod 600 "$HOME/.ssh/echo_ci"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 --branch "$SRC_REF" "git@github.com:$SOURCE_REPO.git" src
+          git -C src config --unset-all core.sshCommand 2>/dev/null || true
+          rm -f "$HOME/.ssh/echo_ci"
+          echo "ausgecheckt: $SRC_REF → $(git -C src rev-parse --short HEAD)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src/src-tauri -> target"
+
+      # libasound2-dev: cpal/alsa-sys (Audio-Capture). libxdo-dev: enigo
+      # (synthetische Eingaben). Beide hängen an Default-Features → ohne sie
+      # scheitert schon `cargo check`.
+      - name: Linux Tauri-Systemdeps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libasound2-dev libxdo-dev
+
+      - name: Frontend bauen (tsc + vite)
+        working-directory: src
+        run: |
+          npm ci
+          npm run build
+
+      - name: cargo check + test (BLOCKING)
+        working-directory: src/src-tauri
+        run: |
+          cargo check --locked
+          cargo test --locked
+
+      # LÜCKE, die echo-tauris pr-check.yml offen lässt: `cargo test` in src-tauri
+      # testet NUR das Paket `echo`. `meet-core` ist eine Pfad-Abhängigkeit und
+      # src-tauri/Cargo.toml hat KEINEN [workspace]-Abschnitt → die 15 Tests der
+      # Diarisierungs-Kette (digits, matching_synthetic, golden_replay) laufen nie
+      # mit. Lokal gemessen: 15 passed, 0 failed, ~7 s. Genau die Kette entscheidet
+      # über die Sprecher-Zuordnung in Meetings — sie gehört ins Gate.
+      # golden_replay skippt sauber, wenn die (gitignorten) Biometrie-Fixtures
+      # fehlen — im Repo ist KEINES getrackt, auf dem Runner also immer Skip.
+      - name: cargo test — vendored meet-core (BLOCKING)
+        working-directory: src/src-tauri/crates/meet-core
+        run: cargo test --locked
+
+      - name: clippy (advisory)
+        working-directory: src/src-tauri
+        run: cargo clippy --locked -- -D warnings || cargo clippy --locked
+
+  # ── Windows-Gate: kompiliert den #[cfg(windows)]-Code ───────────────────────
+  # Spiegelt echo-tauri/.github/workflows/win-check.yml. Echos OS-spezifischer
+  # Code (inject.rs, meeting_detect.rs, WASAPI-Loopback) steckt hinter
+  # #[cfg(windows)] — der Linux-Job oben überspringt ihn KOMPLETT. Ohne diesen
+  # Job könnte Windows-Code brechen, während die CI grün bleibt.
+  windows:
+    name: cargo check (Windows, cfg(windows)-Code)
+    runs-on: windows-latest
+    steps:
+      - name: Quellcode auschecken (privat, read-only Deploy-Key)
+        shell: bash
+        env:
+          SRC_REF: ${{ inputs.ref }}
+          DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/echo_ci"
+          chmod 600 "$HOME/.ssh/echo_ci"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 --branch "$SRC_REF" "git@github.com:$SOURCE_REPO.git" src
+          git -C src config --unset-all core.sshCommand 2>/dev/null || true
+          rm -f "$HOME/.ssh/echo_ci"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src/src-tauri -> target"
+
+      # tauri-build validiert die Config und erwartet ein vorhandenes dist/.
+      - name: Frontend bauen
+        working-directory: src
+        run: |
+          npm ci
+          npm run build
+
+      - name: cargo check (Default-Features → kein whisper.cpp/cmake nötig)
+        working-directory: src/src-tauri
+        run: cargo check --locked
