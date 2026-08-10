@@ -10,7 +10,7 @@ dieses Repositories.
 
 **Auto-Update-Feed:** `https://github.com/subunit-ai/echo-releases/releases/latest/download/latest.json`
 
-Alpha-Tags wie `v0.5.158-alpha.1` werden als GitHub-Prerelease veröffentlicht.
+Alpha-Tags wie `v0.5.160-alpha.1` werden als GitHub-Prerelease veröffentlicht.
 Sie ersetzen weder den neuesten stabilen Release noch dessen Auto-Update-Feed.
 
 © Subunit. Alle Rechte vorbehalten.
