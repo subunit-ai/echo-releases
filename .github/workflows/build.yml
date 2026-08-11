@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: "echo-tauri Tag/Ref zum Bauen (z. B. v0.5.160-alpha.1)"
+        description: "echo-tauri Tag/Ref zum Bauen (z. B. v0.5.161-alpha.1)"
         required: true
       release_tag:
         description: "Release-Label hier in echo-releases (leer = wie source_ref)"
