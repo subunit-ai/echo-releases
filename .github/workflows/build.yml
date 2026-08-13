@@ -129,6 +129,19 @@ jobs:
 
           matches=$(exact_releases)
           count=$(printf '%s' "$matches" | jq 'length')
+          # GitHubs Release-Liste ist nach einem POST kurz eventual-consistent.
+          # Ein direkt folgender Retry-Run darf einen gerade erzeugten Draft
+          # deshalb nicht als "fehlt" missverstehen und einen zweiten anlegen.
+          # Bei einem wirklich neuen Tag kosten die vier Settle-Reads nur 8 s.
+          if [ "$count" -eq 0 ]; then
+            for visibility_attempt in $(seq 1 4); do
+              sleep 2
+              matches=$(exact_releases)
+              count=$(printf '%s' "$matches" | jq 'length')
+              [ "$count" -eq 0 ] || break
+              echo "release discovery settle $visibility_attempt/4: $TAG noch nicht sichtbar"
+            done
+          fi
           if [ "$count" -gt 1 ]; then
             printf '%s' "$matches" | jq -r '.[] | "::error::duplicate release id=\(.id) draft=\(.draft) url=\(.html_url)"'
             echo "::error::$TAG hat bereits $count Releases; keine Assets werden hochgeladen."
@@ -160,14 +173,36 @@ jobs:
           fi
 
           # Unter derselben Tag-Concurrency muss nach Create/Reuse exakt ein
-          # Release existieren. Bei externer Race lieber sicher stoppen als
-          # wieder einen Split-Draft zu produzieren.
-          matches=$(exact_releases)
-          count=$(printf '%s' "$matches" | jq 'length')
-          canonical=$(printf '%s' "$matches" | jq -r --argjson id "$id" \
-            '[.[] | select(.id == $id and .draft == true and .prerelease == false)] | length')
-          if [ "$count" -ne 1 ] || [ "$canonical" -ne 1 ]; then
-            echo "::error::release reservation lost its invariant (count=$count canonical=$canonical)"
+          # Release existieren. Die ID ist sofort direkt lesbar, die Listenroute
+          # brauchte im echten Alpha.6-Lauf dagegen >800 ms bis zur Sichtbarkeit.
+          # Darum bounded retry statt falschem Rot; Duplikate stoppen sofort.
+          direct=$(gh api "repos/$REPO/releases/$id")
+          direct_canonical=$(printf '%s' "$direct" | jq -r --arg tag "$TAG" \
+            'select(.tag_name == $tag and .draft == true and .prerelease == false) | .id')
+          if [ "$direct_canonical" != "$id" ]; then
+            echo "::error::reserved release id=$id is not the canonical draft for $TAG"
+            exit 1
+          fi
+          reservation_ok=0
+          for visibility_attempt in $(seq 1 10); do
+            matches=$(exact_releases)
+            count=$(printf '%s' "$matches" | jq 'length')
+            canonical=$(printf '%s' "$matches" | jq -r --argjson id "$id" \
+              '[.[] | select(.id == $id and .draft == true and .prerelease == false)] | length')
+            if [ "$count" -gt 1 ]; then
+              printf '%s' "$matches" | jq -r '.[] | "::error::duplicate release id=\(.id) draft=\(.draft) url=\(.html_url)"'
+              echo "::error::release reservation lost its invariant (count=$count canonical=$canonical)"
+              exit 1
+            fi
+            if [ "$count" -eq 1 ] && [ "$canonical" -eq 1 ]; then
+              reservation_ok=1
+              break
+            fi
+            echo "release visibility retry $visibility_attempt/10: count=$count canonical=$canonical"
+            sleep 2
+          done
+          if [ "$reservation_ok" -ne 1 ]; then
+            echo "::error::release reservation lost its invariant after bounded retry (count=$count canonical=$canonical)"
             exit 1
           fi
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
