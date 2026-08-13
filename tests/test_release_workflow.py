@@ -27,6 +27,13 @@ class ReleaseWorkflowContract(unittest.TestCase):
         self.assertIn("release reservation lost its invariant", WORKFLOW)
         self.assertIn("refusing ambiguous publish", WORKFLOW)
 
+    def test_release_discovery_retries_eventual_consistency_without_losing_fail_closed(self) -> None:
+        self.assertIn("release discovery settle $visibility_attempt/4", WORKFLOW)
+        self.assertIn("for visibility_attempt in $(seq 1 10)", WORKFLOW)
+        self.assertIn('direct=$(gh api "repos/$REPO/releases/$id")', WORKFLOW)
+        self.assertIn("reservation_ok=0", WORKFLOW)
+        self.assertIn("after bounded retry", WORKFLOW)
+
     def test_publish_uses_exact_id_and_normal_latest_channel(self) -> None:
         self.assertIn('rel=$(gh api "repos/$repo/releases/$id")', WORKFLOW)
         self.assertNotIn('select(.tag_name==\\"$tag\\")][0]', WORKFLOW)
