@@ -31,6 +31,7 @@ class ReleaseWorkflowContract(unittest.TestCase):
         self.assertIn("release discovery settle $visibility_attempt/4", WORKFLOW)
         self.assertIn("for visibility_attempt in $(seq 1 10)", WORKFLOW)
         self.assertIn('direct=$(gh api "repos/$REPO/releases/$id")', WORKFLOW)
+        self.assertIn('-f tag_name="$TAG" -f name="Echo $TAG"', WORKFLOW)
         self.assertIn("reservation_ok=0", WORKFLOW)
         self.assertIn("after bounded retry", WORKFLOW)
 
