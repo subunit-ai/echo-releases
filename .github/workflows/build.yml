@@ -157,8 +157,11 @@ jobs:
             id=$(printf '%s' "$release" | jq -r '.id')
             # Ein alter Draft darf wiederaufgenommen werden, wird aber schon vor
             # dem Build auf den normalen (nicht-Prerelease-)Kanal normalisiert.
+            # `tag_name` MUSS beim PATCH erneut mit: GitHub ersetzt den externen
+            # Quelltag sonst bei Drafts still durch `untagged-<uuid>`.
             gh api -X PATCH "repos/$REPO/releases/$id" \
-              -f name="Echo $TAG" -F draft=true -F prerelease=false > /dev/null
+              -f tag_name="$TAG" -f name="Echo $TAG" \
+              -F draft=true -F prerelease=false > /dev/null
             echo "reuse canonical draft $id for $TAG"
           else
             release=$(gh api -X POST "repos/$REPO/releases" \
