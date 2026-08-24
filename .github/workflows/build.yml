@@ -224,9 +224,9 @@ jobs:
           - platform: windows-latest
             args: "--features local-whisper-gpu"
           - platform: windows-11-arm
-            args: "--features local-meet"
+            args: "--features local-whisper"
           - platform: macos-14
-            args: "--target aarch64-apple-darwin --features local-meet"
+            args: "--target aarch64-apple-darwin --features local-whisper"
 
     runs-on: ${{ matrix.platform }}
     steps:
