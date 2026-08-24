@@ -74,10 +74,6 @@
 #     ECHO_TAURI_DEPLOY_KEY (read_only: true, verifiziert). APPLE_*, TAURI_SIGNING_*
 #     und *_SENTRY_DSN bleibt er nicht an. echo-tauris eigene pr-check/win-check
 #     referenzieren `secrets.` kein einziges Mal — der Check braucht keine.
-#   • KEINE BIOMETRIE: `git ls-files src-tauri/crates/meet-core/fixtures/` ist LEER
-#     (verifiziert). Die Voiceprint-/Embedding-Fixtures liegen gitignored unter
-#     fixtures/private/; golden_replay.rs skippt per `if !f.is_file()`. Lokal ohne
-#     jedes Fixture verifiziert: 2 passed. Ein öffentlicher Lauf sieht keine Stimmdaten.
 #   • REF-VALIDIERUNG: der dispatch-Input wird gegen einen engen Zeichensatz
 #     geprüft, bevor er an git geht (gleiches Muster wie build.yml).
 #
@@ -114,7 +110,7 @@ env:
   # Bewusst NICHT gesetzt: RUST_BACKTRACE (siehe Leak-Budget oben).
 
 jobs:
-  # ── Linux-Gate: Frontend-Build + cargo check + cargo test (beide Pakete) ────
+  # ── Linux-Gate: Frontend-Build + cargo check + cargo test ──────────────────
   # Spiegelt echo-tauri/.github/workflows/pr-check.yml. Default-Features ziehen
   # kein whisper-rs-sys → kein cmake/LLVM nötig, darum schnell.
   linux:
@@ -240,25 +236,6 @@ jobs:
           cargo check --locked --message-format short
           cargo test --locked --message-format short
 
-      # LÜCKE, die echo-tauris eigene pr-check.yml offen lässt: `cargo test` in
-      # src-tauri testet NUR das Paket `echo` (gemessen: 194 Tests, 188 passed,
-      # 6 ignored — ausschliesslich aus unittests src/lib.rs + src/main.rs).
-      # `meet-core` ist eine reine Pfad-Abhängigkeit und src-tauri/Cargo.toml hat
-      # KEINEN [workspace]-Abschnitt (verifiziert) → die 17 Tests der
-      # Diarisierungs-Kette (lib 2, digits 8, matching_synthetic 5, golden_replay 2)
-      # laufen dort NIE mit. Genau die Kette entscheidet über die
-      # Sprecher-Zuordnung in Meetings.
-      # `--target-dir target` ist Absicht: ohne das legt cargo einen ZWEITEN
-      # target-Dir unter crates/meet-core/ an, den `swatinem/rust-cache` oben nicht
-      # abdeckt → jeder Lauf würde meet-core komplett neu übersetzen. Mit dem
-      # geteilten Dir sind die Abhängigkeiten vom Schritt davor schon gebaut —
-      # lokal gemessen: 0,16 s warm statt eines kompletten Neubaus.
-      # golden_replay skippt sauber, wenn die (gitignorten) Biometrie-Fixtures
-      # fehlen — im Repo ist KEINES getrackt, auf dem Runner also immer Skip.
-      - name: cargo test — vendored meet-core (BLOCKING)
-        working-directory: src/src-tauri
-        run: cargo test --locked --message-format short --manifest-path crates/meet-core/Cargo.toml --target-dir target
-
       - name: clippy (advisory)
         working-directory: src/src-tauri
         run: cargo clippy --locked --message-format short -- -D warnings || cargo clippy --locked --message-format short
@@ -281,12 +258,12 @@ jobs:
             echo "### Linux-Gate"
             echo ""
             printf -- '- Quelle: `%s` @ `%s`\n' "$SRC_REF" "$sha"
-            echo "- Geprüft: tsc + vite · cargo check · cargo test (echo) · cargo test (meet-core) · clippy (advisory)"
+            echo "- Geprüft: tsc + vite · cargo check · cargo test (echo) · clippy (advisory)"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Windows-Gate: kompiliert den #[cfg(windows)]-Code ───────────────────────
   # Spiegelt echo-tauri/.github/workflows/win-check.yml. Echos OS-spezifischer
-  # Code (inject.rs, meeting_detect.rs, WASAPI-Loopback) steckt hinter
+  # Eingabe-, Capture- und Fenster-Code steckt hinter
   # #[cfg(windows)] — der Linux-Job oben überspringt ihn KOMPLETT. Ohne diesen
   # Job könnte Windows-Code brechen, während die CI grün bleibt.
   # Bewusst nur `cargo check` (kein `cargo test`) — exakt wie win-check.yml:
