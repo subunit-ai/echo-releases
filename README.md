@@ -14,8 +14,14 @@ Echo-Releases enthalten ausschließlich die Diktat-Engine (`local-whisper` bzw.
 `local-whisper-gpu`). Meeting-Aufzeichnung, Diarisierung und Voiceprints gehören
 zum eigenständigen SCAI-Meet-Plugin und sind kein Echo-Releasebestandteil mehr.
 
-Auch Alpha-Tags wie `v0.5.164-alpha.5` werden bewusst als **normale GitHub-Releases**
-veröffentlicht und als `Latest` markiert. Damit läuft der normale Echo-Updater immer
-über genau denselben Kanal; es gibt keinen separaten Prerelease-Kanal.
+Automatische Poller bauen ausschließlich suffixlose Stable-Tags wie `v0.5.166`;
+dieser Kanal veröffentlicht weiterhin atomar als normalen GitHub-`Latest` und
+speist Echos Standard-Updater.
+
+Ein signierter Testkandidat kann ausschließlich manuell mit `release_mode=draft_rc`
+und einem exakt passenden Tag wie `v0.5.166-rc.1` gebaut werden. Er bleibt als
+nicht öffentlich gelisteter GitHub-Draft mit gesetztem Prerelease-Merkmal bestehen
+und wird niemals `Latest`. Dadurch kann er von einem Maintainer geprüft und manuell
+installiert werden, ohne reguläre Echo-Installationen zu aktualisieren.
 
 © Subunit. Alle Rechte vorbehalten.

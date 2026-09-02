@@ -9,7 +9,7 @@ name: build
 #
 # Anstoß auf DREI Wegen (bewusst KEIN Trigger im privaten Repo — das bräuchte
 # private Minuten):
-#   • schedule (Poller) — prüft alle 15 min, ob echo-tauri einen neuen Versions-Tag
+#   • schedule (Poller) — prüft alle 15 min, ob echo-tauri einen neuen Stable-Tag
 #     hat, der hier noch kein published Release ist, und baut ihn. So bleibt TJs
 #     Ablauf „Version taggen + pushen" unverändert, ohne dass echo-tauri eine Action
 #     laufen lassen muss.
@@ -21,11 +21,19 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: "echo-tauri Tag/Ref zum Bauen (z. B. v0.5.164-alpha.5)"
+        description: "echo-tauri Tag/Ref zum Bauen (z. B. v0.5.166-rc.1)"
         required: true
       release_tag:
         description: "Release-Label hier in echo-releases (leer = wie source_ref)"
         required: false
+      release_mode:
+        description: "Stable veröffentlichen oder signierten RC als privaten Draft behalten"
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - draft_rc
   repository_dispatch:
     types: [build-release]
 
@@ -37,23 +45,29 @@ jobs:
   # Ref (Quelle) + Tag (Release-Label) EINMAL bestimmen und streng validieren.
   # Beim Poller (schedule): neuesten Versions-Tag aus dem PRIVATEN echo-tauri holen
   # und nur bauen, wenn hier noch kein published Release dafür existiert. Sonst:
-  # expliziter Ref aus dispatch/input. Nur vX.Y.Z(-suffix) wird durchgelassen
-  # (kein Branch, keine Shell-Metazeichen → keine Injection). should_build=false
+  # expliziter Ref aus dispatch/input. Stable akzeptiert ausschließlich vX.Y.Z;
+  # manuelles draft_rc ausschließlich vX.Y.Z-rc.N. Keine Branches oder Shell-
+  # Metazeichen. should_build=false
   # überspringt die Build-/Publish-Jobs (Poller ohne neue Version = No-op).
   prepare:
     runs-on: ubuntu-24.04
     outputs:
       ref: ${{ steps.pick.outputs.ref }}
       tag: ${{ steps.pick.outputs.tag }}
+      release_mode: ${{ steps.policy.outputs.release_mode }}
+      prerelease: ${{ steps.policy.outputs.prerelease }}
       should_build: ${{ steps.pick.outputs.should_build }}
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - id: pick
         env:
           EV: ${{ github.event_name }}
           DISPATCH_REF: ${{ github.event.client_payload.ref }}
           DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          DISPATCH_MODE: ${{ github.event.client_payload.release_mode }}
           INPUT_REF: ${{ github.event.inputs.source_ref }}
           INPUT_TAG: ${{ github.event.inputs.release_tag }}
+          INPUT_MODE: ${{ github.event.inputs.release_mode }}
           DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           THIS_REPO: ${{ github.repository }}
@@ -66,7 +80,7 @@ jobs:
             export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
             ref=$(git ls-remote --tags --refs "git@github.com:$SOURCE_REPO.git" 'v*' 2>/dev/null \
                     | awk -F/ '{print $NF}' \
-                    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$' \
+                    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
                     | sort -V | tail -1 || true)
             rm -f ~/.ssh/echo_ci
             if [ -z "$ref" ]; then
@@ -76,26 +90,25 @@ jobs:
             if [ "$(gh release view "$ref" -R "$THIS_REPO" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)" = "false" ]; then
               echo "$ref ist bereits published — No-op"; echo "should_build=false" >> "$GITHUB_OUTPUT"; exit 0
             fi
-            tag="$ref"; echo "neuer Tag $ref → wird gebaut"
+            tag="$ref"; mode=stable; echo "neuer Stable-Tag $ref → wird gebaut"
           elif [ "$EV" = "repository_dispatch" ]; then
-            ref="$DISPATCH_REF"; tag="${DISPATCH_TAG:-$DISPATCH_REF}"
+            ref="$DISPATCH_REF"; tag="${DISPATCH_TAG:-$DISPATCH_REF}"; mode="${DISPATCH_MODE:-stable}"
           else
-            ref="$INPUT_REF"; tag="${INPUT_TAG:-$INPUT_REF}"
+            ref="$INPUT_REF"; tag="${INPUT_TAG:-$INPUT_REF}"; mode="${INPUT_MODE:-stable}"
           fi
-          # Nur Versions-Tags: vX.Y.Z mit optionalem -suffix (z. B. -citest).
-          re='^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$'
-          echo "$ref" | grep -Eq "$re" || { echo "::error::ungültiger ref: $ref"; exit 1; }
-          echo "$tag" | grep -Eq "$re" || { echo "::error::ungültiger tag: $tag"; exit 1; }
-          ref_suffix=false
-          tag_suffix=false
-          case "$ref" in *-*) ref_suffix=true ;; esac
-          case "$tag" in *-*) tag_suffix=true ;; esac
-          if [ "$ref_suffix" = true ] && [ "$tag_suffix" != true ]; then
-            echo "::error::ein Alpha-Quelltag darf nicht unter einem suffixlosen Tag veröffentlicht werden"
-            exit 1
-          fi
-          printf 'ref=%s\ntag=%s\nshould_build=true\n' "$ref" "$tag" >> "$GITHUB_OUTPUT"
-          echo "Quelle $SOURCE_REPO@$ref  →  normaler Latest-Release $tag"
+          printf 'ref=%s\ntag=%s\nmode=%s\nshould_build=true\n' "$ref" "$tag" "$mode" >> "$GITHUB_OUTPUT"
+
+      - id: policy
+        if: steps.pick.outputs.should_build == 'true'
+        env:
+          EV: ${{ github.event_name }}
+          REF: ${{ steps.pick.outputs.ref }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          MODE: ${{ steps.pick.outputs.mode }}
+        run: |
+          set -euo pipefail
+          bash scripts/release_policy.sh "$EV" "$REF" "$TAG" "$MODE" | tee -a "$GITHUB_OUTPUT"
+          echo "Quelle $SOURCE_REPO@$REF → $MODE $TAG"
 
   # Genau EINEN kanonischen Draft reservieren, BEVOR die Plattform-Matrix
   # startet. `releaseId` ist danach die einzige Upload-Adresse. Damit können
@@ -119,6 +132,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
 
@@ -156,17 +170,17 @@ jobs:
             fi
             id=$(printf '%s' "$release" | jq -r '.id')
             # Ein alter Draft darf wiederaufgenommen werden, wird aber schon vor
-            # dem Build auf den normalen (nicht-Prerelease-)Kanal normalisiert.
+            # dem Build auf den explizit gewählten Kanal normalisiert.
             # `tag_name` MUSS beim PATCH erneut mit: GitHub ersetzt den externen
             # Quelltag sonst bei Drafts still durch `untagged-<uuid>`.
             gh api -X PATCH "repos/$REPO/releases/$id" \
               -f tag_name="$TAG" -f name="Echo $TAG" \
-              -F draft=true -F prerelease=false > /dev/null
+              -F draft=true -F prerelease="$PRERELEASE" > /dev/null
             echo "reuse canonical draft $id for $TAG"
           else
             release=$(gh api -X POST "repos/$REPO/releases" \
               -f tag_name="$TAG" -f name="Echo $TAG" \
-              -F draft=true -F prerelease=false)
+              -F draft=true -F prerelease="$PRERELEASE")
             id=$(printf '%s' "$release" | jq -r '.id // empty')
             if [ -z "$id" ]; then
               echo "::error::GitHub returned no release id for $TAG"
@@ -180,8 +194,8 @@ jobs:
           # brauchte im echten Alpha.6-Lauf dagegen >800 ms bis zur Sichtbarkeit.
           # Darum bounded retry statt falschem Rot; Duplikate stoppen sofort.
           direct=$(gh api "repos/$REPO/releases/$id")
-          direct_canonical=$(printf '%s' "$direct" | jq -r --arg tag "$TAG" \
-            'select(.tag_name == $tag and .draft == true and .prerelease == false) | .id')
+          direct_canonical=$(printf '%s' "$direct" | jq -r --arg tag "$TAG" --argjson prerelease "$PRERELEASE" \
+            'select(.tag_name == $tag and .draft == true and .prerelease == $prerelease) | .id')
           if [ "$direct_canonical" != "$id" ]; then
             echo "::error::reserved release id=$id is not the canonical draft for $TAG"
             exit 1
@@ -190,8 +204,8 @@ jobs:
           for visibility_attempt in $(seq 1 10); do
             matches=$(exact_releases)
             count=$(printf '%s' "$matches" | jq 'length')
-            canonical=$(printf '%s' "$matches" | jq -r --argjson id "$id" \
-              '[.[] | select(.id == $id and .draft == true and .prerelease == false)] | length')
+            canonical=$(printf '%s' "$matches" | jq -r --argjson id "$id" --argjson prerelease "$PRERELEASE" \
+              '[.[] | select(.id == $id and .draft == true and .prerelease == $prerelease)] | length')
             if [ "$count" -gt 1 ]; then
               printf '%s' "$matches" | jq -r '.[] | "::error::duplicate release id=\(.id) draft=\(.draft) url=\(.html_url)"'
               echo "::error::release reservation lost its invariant (count=$count canonical=$canonical)"
@@ -435,7 +449,7 @@ jobs:
           releaseId: ${{ needs.reserve.outputs.release_id }}
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseDraft: true
-          prerelease: false
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}
 
   publish:
@@ -450,13 +464,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Assemble + validate latest.json, publish
+      - name: Assemble + validate latest.json; publish Stable or retain Draft RC
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           tag="${{ needs.prepare.outputs.tag }}"
           id="${{ needs.reserve.outputs.release_id }}"
+          mode="${{ needs.prepare.outputs.release_mode }}"
+          prerelease="${{ needs.prepare.outputs.prerelease }}"
           repo="${{ github.repository }}"
           now="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
           base_url="https://github.com/$repo/releases/download/$tag"
@@ -464,7 +480,7 @@ jobs:
           rel=$(gh api "repos/$repo/releases/$id")
           if [ "$(echo "$rel" | jq -r '.tag_name')" != "$tag" ] \
              || [ "$(echo "$rel" | jq -r '.draft')" != true ] \
-             || [ "$(echo "$rel" | jq -r '.prerelease')" != false ]; then
+             || [ "$(echo "$rel" | jq -r '.prerelease')" != "$prerelease" ]; then
             echo "::error::release $id no longer matches canonical draft $tag"
             exit 1
           fi
@@ -534,6 +550,16 @@ jobs:
           echo "manifest platforms:"; jq '.platforms | keys' /tmp/latest.json
 
           gh release upload "$tag" -R "$repo" /tmp/latest.json --clobber
-          gh api -X PATCH "repos/$repo/releases/$id" \
-            -F draft=false -F prerelease=false -f make_latest=true > /dev/null
-          echo "published $tag as normal GitHub Latest (release $id) on $repo"
+          if [ "$mode" = "draft_rc" ]; then
+            final=$(gh api "repos/$repo/releases/$id")
+            if [ "$(echo "$final" | jq -r '.draft')" != true ] \
+               || [ "$(echo "$final" | jq -r '.prerelease')" != true ]; then
+              echo "::error::RC release $id escaped its draft/prerelease boundary"
+              exit 1
+            fi
+            echo "signed RC $tag retained as private draft (release $id); Latest unchanged"
+          else
+            gh api -X PATCH "repos/$repo/releases/$id" \
+              -F draft=false -F prerelease=false -f make_latest=true > /dev/null
+            echo "published $tag as normal GitHub Latest (release $id) on $repo"
+          fi
