@@ -37,6 +37,17 @@ on:
   repository_dispatch:
     types: [build-release]
 
+# Ein Release-Build umfasst Reservierung, vier Plattform-Uploads und das atomare
+# Publish. Alle Trigger teilen absichtlich EIN Schloss: startet der Poller kurz
+# nach einem manuellen Lauf, wartet er bis zum Publish und erkennt den Tag danach
+# im prepare-Job als bereits veröffentlichten No-op. Ein nur am reserve-Job
+# gesetztes Tag-Schloss reicht nicht, weil die parallelen Matrix-Jobs sonst
+# denselben Draft gleichzeitig hochladen und zwei Publish-Jobs gegeneinander
+# laufen können.
+concurrency:
+  group: echo-release-build
+  cancel-in-progress: false
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   SOURCE_REPO: subunit-ai/echo-tauri

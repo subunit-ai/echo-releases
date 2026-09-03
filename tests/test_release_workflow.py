@@ -30,6 +30,13 @@ class ReleaseWorkflowContract(unittest.TestCase):
         self.assertIn("release reservation lost its invariant", WORKFLOW)
         self.assertIn("refusing ambiguous publish", WORKFLOW)
 
+    def test_all_triggers_share_one_full_workflow_lock(self) -> None:
+        workflow_header = WORKFLOW.split("\njobs:\n", 1)[0]
+        self.assertRegex(
+            workflow_header,
+            r"\nconcurrency:\n\s+group: echo-release-build\n\s+cancel-in-progress: false\n",
+        )
+
     def test_release_discovery_retries_eventual_consistency_without_losing_fail_closed(self) -> None:
         self.assertIn("release discovery settle $visibility_attempt/4", WORKFLOW)
         self.assertIn("for visibility_attempt in $(seq 1 10)", WORKFLOW)
