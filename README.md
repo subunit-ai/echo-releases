@@ -18,6 +18,11 @@ Automatische Poller bauen ausschließlich suffixlose Stable-Tags wie `v0.5.166`;
 dieser Kanal veröffentlicht weiterhin atomar als normalen GitHub-`Latest` und
 speist Echos Standard-Updater.
 
+Manuelle Builds, Poller und externe Dispatches teilen ein workflowweites
+Release-Schloss. Überschneiden sich zwei Trigger, wartet der spätere Lauf bis zum
+vollständigen Publish und wird anschließend zum No-op; Assets und Publish-Job
+können dadurch nie parallel auf denselben Draft zugreifen.
+
 Ein signierter Testkandidat kann ausschließlich manuell mit `release_mode=draft_rc`
 und einem exakt passenden Tag wie `v0.5.166-rc.1` gebaut werden. Er bleibt als
 nicht öffentlich gelisteter GitHub-Draft mit gesetztem Prerelease-Merkmal bestehen
