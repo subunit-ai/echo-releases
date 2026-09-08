@@ -11,8 +11,8 @@ ref="$2"
 tag="$3"
 mode="$4"
 
-stable_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
-rc_re='^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$'
+stable_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+rc_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[1-9][0-9]*$'
 
 case "$mode" in
   stable)
@@ -22,6 +22,10 @@ case "$mode" in
     fi
     if [[ ! "$tag" =~ $stable_re ]]; then
       echo "::error::stable release_tag must be suffixless vX.Y.Z: $tag" >&2
+      exit 1
+    fi
+    if [ "$tag" != "$ref" ]; then
+      echo "::error::stable release_tag must exactly equal source_ref" >&2
       exit 1
     fi
     prerelease=false
@@ -47,4 +51,12 @@ case "$mode" in
     ;;
 esac
 
-printf 'release_mode=%s\nprerelease=%s\n' "$mode" "$prerelease"
+source_version="${ref#v}"
+source_major="${source_version%%.*}"
+requires_platform_trust=false
+if [ "$source_major" != "0" ]; then
+  requires_platform_trust=true
+fi
+
+printf 'release_mode=%s\nprerelease=%s\nrequires_platform_trust=%s\n' \
+  "$mode" "$prerelease" "$requires_platform_trust"

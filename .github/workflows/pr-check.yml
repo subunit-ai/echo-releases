@@ -77,12 +77,12 @@
 #   • REF-VALIDIERUNG: der dispatch-Input wird gegen einen engen Zeichensatz
 #     geprüft, bevor er an git geht (gleiches Muster wie build.yml).
 #
-# 🔴 HARTE REGEL FÜR DIESES REPO: hier NIE einen `pull_request`-getriggerten
-# Workflow ergänzen. `swatinem/rust-cache` legt den target-Dir — mit Debug-Info
-# und Quellpfaden aus privatem Code — in den Actions-Cache von echo-releases.
-# Solange kein fork-triggerbarer Workflow existiert, kann kein Fork einen Lauf
-# starten und diesen Cache lesen. Heute ist das dicht: build.yml ist
-# schedule/dispatch/repository_dispatch, dieser hier ist dispatch-only.
+# VERTRAULICHKEIT: Compiler-/target-Verzeichnisse aus echo-tauri werden nicht
+# gecacht. release-contract.yml akzeptiert öffentliche PRs, und Fork-PRs können
+# Default-Branch-Caches workflowübergreifend lesen. Ein bloß dispatch-getriggerter
+# Build schützt seine Cache-Inhalte daher nicht. Öffentliche npm-Pakete dürfen
+# weiterhin gecacht werden; private Quellen/Compiler-Ausgaben niemals.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching
 # ──────────────────────────────────────────────────────────────────────────────
 
 name: PR Check (Quell-Repo)
@@ -118,10 +118,8 @@ jobs:
     runs-on: ubuntu-latest
     # Kappt einen hängenden Compile. (Wartezeit in der Runner-Queue zählt hier
     # NICHT mit — timeout-minutes läuft erst ab Job-Start.)
-    # 45 statt 30: der rust-cache dieses Repos ist für pr-check anfangs LEER, der
-    # erste Lauf übersetzt also den kompletten Dependency-Baum. Ein Timeout wäre
-    # hier kein Schutz, sondern ein Dauer-Rot — und ein Dauer-Rot erzieht nur dazu,
-    # mit `ship.sh --no-wait` daran vorbeizugehen. Public-Minuten kosten nichts.
+    # Builds deliberately compile without a shared private target cache. Allow
+    # enough time for a cold dependency graph on the public hosted runner.
     timeout-minutes: 45
     steps:
       # Manueller git clone statt actions/checkout+ssh-key: identisch zu build.yml,
@@ -205,9 +203,8 @@ jobs:
         with:
           components: clippy
 
-      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: "src/src-tauri -> target"
+      # Private compiler outputs must not enter this public repository's cache.
+      # Fork PRs can read caches in the base branch, independently of workflow.
 
       # libasound2-dev: cpal/alsa-sys (Audio-Capture). libxdo-dev: enigo
       # (synthetische Eingaben). Beide hängen an Default-Features → ohne sie
@@ -334,9 +331,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: "src/src-tauri -> target"
+      # Private compiler outputs must not enter this public repository's cache.
+      # Fork PRs can read caches in the base branch, independently of workflow.
 
       # tauri-build validiert die Config und erwartet ein vorhandenes dist/.
       - name: Frontend bauen

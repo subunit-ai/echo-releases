@@ -64,9 +64,11 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       ref: ${{ steps.pick.outputs.ref }}
+      source_commit: ${{ steps.source.outputs.commit }}
       tag: ${{ steps.pick.outputs.tag }}
       release_mode: ${{ steps.policy.outputs.release_mode }}
       prerelease: ${{ steps.policy.outputs.prerelease }}
+      requires_platform_trust: ${{ steps.policy.outputs.requires_platform_trust }}
       should_build: ${{ steps.pick.outputs.should_build }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -120,6 +122,28 @@ jobs:
           set -euo pipefail
           bash scripts/release_policy.sh "$EV" "$REF" "$TAG" "$MODE" | tee -a "$GITHUB_OUTPUT"
           echo "Quelle $SOURCE_REPO@$REF → $MODE $TAG"
+
+      - id: source
+        name: Pin the exact private source commit
+        if: steps.pick.outputs.should_build == 'true'
+        env:
+          DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
+          REF: ${{ steps.pick.outputs.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/echo_ci
+          chmod 600 ~/.ssh/echo_ci
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
+          refs=$(git ls-remote "git@github.com:$SOURCE_REPO.git" \
+            "refs/tags/$REF" "refs/tags/$REF^{}")
+          rm -f ~/.ssh/echo_ci
+          direct=$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$REF" '$2 == ref { print $1 }')
+          peeled=$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$REF^{}" '$2 == ref { print $1 }')
+          commit="${peeled:-$direct}"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::source tag $REF did not resolve to one commit"; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   # Genau EINEN kanonischen Draft reservieren, BEVOR die Plattform-Matrix
   # startet. `releaseId` ist danach die einzige Upload-Adresse. Damit können
@@ -266,6 +290,7 @@ jobs:
         env:
           DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
           REF: ${{ needs.prepare.outputs.ref }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
         run: |
           set -eu
           mkdir -p ~/.ssh
@@ -275,6 +300,8 @@ jobs:
           git clone --depth 1 --branch "$REF" "git@github.com:subunit-ai/echo-tauri.git" .
           git config --unset-all core.sshCommand 2>/dev/null || true
           rm -f ~/.ssh/echo_ci
+          [ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ] \
+            || { echo "::error::source tag moved after prepare"; exit 1; }
 
       - name: Install Linux deps
         if: matrix.platform == 'ubuntu-24.04'
@@ -413,10 +440,6 @@ jobs:
           console.log(`version contract verified: ${expected}`);
           NODE
 
-      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: "./src-tauri -> target"
-
       - run: npm ci
 
       - name: macOS signing keychain (stable self-signed cert — keeps TCC grants across updates)
@@ -463,21 +486,294 @@ jobs:
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}
 
-  publish:
-    # Atomar: Draft erst public schalten, wenn ALLE Plattformen + eine VOLLSTÄNDIGE
-    # latest.json da sind. Der Draft liegt bereits in echo-releases — die latest.json
-    # wird deterministisch aus den .sig-Assets zusammengesetzt (signature = .sig-Inhalt
-    # VERBATIM, nicht neu enkodieren), und wir verweigern das Publish bei fehlender
-    # Plattform. Kein zweites Repo, kein Mirror.
+  verify_updater_trust:
     needs: [prepare, reserve, build]
     if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     permissions:
+      contents: read
+    outputs:
+      evidence: ${{ steps.verify.outputs.evidence }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Install Minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+      - name: Checkout the exact source commit that was built
+        env:
+          DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
+          REF: ${{ needs.prepare.outputs.ref }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/echo_ci
+          chmod 600 ~/.ssh/echo_ci
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 --branch "$REF" "git@github.com:$SOURCE_REPO.git" _source
+          rm -f ~/.ssh/echo_ci
+          [ "$(git -C _source rev-parse HEAD)" = "$SOURCE_COMMIT" ] \
+            || { echo "::error::source tag moved after prepare"; exit 1; }
+          expected="${REF#v}"
+          actual=$(jq -r '.version // empty' _source/src-tauri/tauri.conf.json)
+          [ "$actual" = "$expected" ] \
+            || { echo "::error::built updater config version=$actual, expected $expected"; exit 1; }
+      - id: verify
+        name: Cryptographically verify four updater pairs and record IDs + hashes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.reserve.outputs.release_id }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          source scripts/release-assets.sh
+          release_assets_load "$REPO" "$RELEASE_ID" "$TAG" "$PRERELEASE"
+          evidence_dir=$(mktemp -d "${RUNNER_TEMP}/echo-updater-evidence.XXXXXX")
+          download_dir=$(mktemp -d "${RUNNER_TEMP}/echo-updater-download.XXXXXX")
+          version="${TAG#v}"
+          mac="echo_aarch64.app.tar.gz"
+          linux="echo_${version}_amd64.AppImage"
+          win64="echo_${version}_x64-setup.exe"
+          winarm="echo_${version}_arm64-setup.exe"
+
+          names=("$mac" "$linux" "$win64" "$winarm")
+          signed_names=("echo.app.tar.gz" "$linux" "$win64" "$winarm")
+          ids=()
+          sig_ids=()
+          for name in "${names[@]}"; do
+            release_asset_download "$name" "$download_dir/$name"
+            ids+=("$RELEASE_ASSET_LAST_ID")
+            release_asset_download "$name.sig" "$download_dir/$name.sig"
+            sig_ids+=("$RELEASE_ASSET_LAST_ID")
+          done
+
+          python3 scripts/verify-updater-signatures.py \
+            --config _source/src-tauri/tauri.conf.json \
+            --evidence-dir "$evidence_dir/minisign" \
+            --output-json "$evidence_dir/verified.json" \
+            --pair "${signed_names[0]}" "$download_dir/${names[0]}" "$download_dir/${names[0]}.sig" \
+            --pair "${signed_names[1]}" "$download_dir/${names[1]}" "$download_dir/${names[1]}.sig" \
+            --pair "${signed_names[2]}" "$download_dir/${names[2]}" "$download_dir/${names[2]}.sig" \
+            --pair "${signed_names[3]}" "$download_dir/${names[3]}" "$download_dir/${names[3]}.sig"
+
+          evidence=$(jq -cn \
+            --slurpfile verified "$evidence_dir/verified.json" \
+            --arg mac "$mac" --arg mac_id "${ids[0]}" --arg mac_sig_id "${sig_ids[0]}" \
+            --arg linux "$linux" --arg linux_id "${ids[1]}" --arg linux_sig_id "${sig_ids[1]}" \
+            --arg win64 "$win64" --arg win64_id "${ids[2]}" --arg win64_sig_id "${sig_ids[2]}" \
+            --arg winarm "$winarm" --arg winarm_id "${ids[3]}" --arg winarm_sig_id "${sig_ids[3]}" \
+            'def item($index; $name; $id; $sig_id): {
+               name: $name, id: ($id | tonumber), sha256: $verified[0].pairs[$index].artifact_sha256,
+               sig_name: ($name + ".sig"), sig_id: ($sig_id | tonumber),
+               sig_sha256: $verified[0].pairs[$index].signature_sha256,
+               signed_filename: $verified[0].pairs[$index].signed_filename
+             };
+             {public_key_sha256: $verified[0].public_key_sha256,
+              mac: item(0; $mac; $mac_id; $mac_sig_id),
+              linux: item(1; $linux; $linux_id; $linux_sig_id),
+              windows_x64: item(2; $win64; $win64_id; $win64_sig_id),
+              windows_arm64: item(3; $winarm; $winarm_id; $winarm_sig_id)}')
+          echo "evidence=$evidence" >> "$GITHUB_OUTPUT"
+          echo "updater evidence retained: $evidence_dir"
+
+  verify_macos_platform_trust:
+    needs: [prepare, reserve, build]
+    if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.requires_platform_trust == 'true'
+    runs-on: macos-14
+    permissions:
+      contents: read
+    outputs:
+      app_archive_sha256: ${{ steps.verify.outputs.app_archive_sha256 }}
+      dmg_sha256: ${{ steps.verify.outputs.dmg_sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - id: verify
+        name: Download and verify canonical macOS artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.reserve.outputs.release_id }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_AUTHORITY: ${{ vars.APPLE_SIGNING_AUTHORITY }}
+        run: |
+          set -euo pipefail
+          [ -n "$APPLE_TEAM_ID" ] || { echo "::error::repository variable APPLE_TEAM_ID is required for v1+"; exit 1; }
+          [ -n "$APPLE_SIGNING_AUTHORITY" ] || { echo "::error::repository variable APPLE_SIGNING_AUTHORITY is required for v1+"; exit 1; }
+          source scripts/release-assets.sh
+          release_assets_load "$REPO" "$RELEASE_ID" "$TAG" "$PRERELEASE"
+
+          work_dir=$(mktemp -d "${RUNNER_TEMP}/echo-macos-download.XXXXXX")
+          version="${TAG#v}"
+          app_archive="echo_aarch64.app.tar.gz"
+          dmg="echo_${version}_aarch64.dmg"
+          release_asset_download "$app_archive" "$work_dir/$app_archive"
+          release_asset_download "$dmg" "$work_dir/$dmg"
+          bash scripts/verify-platform-macos.sh \
+            "$work_dir/$app_archive" "$work_dir/$dmg" \
+            "ai.subunit.echo" "$version" "$APPLE_TEAM_ID" "$APPLE_SIGNING_AUTHORITY"
+          printf 'app_archive_sha256=%s\n' "$(shasum -a 256 "$work_dir/$app_archive" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          printf 'dmg_sha256=%s\n' "$(shasum -a 256 "$work_dir/$dmg" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+  verify_windows_platform_trust:
+    needs: [prepare, reserve, build]
+    if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.requires_platform_trust == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      x64_sha256: ${{ steps.verify.outputs.x64_sha256 }}
+      arm64_sha256: ${{ steps.verify.outputs.arm64_sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Download exact artifacts from canonical draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.reserve.outputs.release_id }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+        run: |
+          set -euo pipefail
+          [ -n "$WINDOWS_PUBLISHER" ] || { echo "::error::repository variable WINDOWS_PUBLISHER is required for v1+"; exit 1; }
+          source scripts/release-assets.sh
+          release_assets_load "$REPO" "$RELEASE_ID" "$TAG" "$PRERELEASE"
+
+          mkdir .platform-trust
+          version="${TAG#v}"
+          win64="echo_${version}_x64-setup.exe"
+          winarm="echo_${version}_arm64-setup.exe"
+          release_asset_download "$win64" ".platform-trust/$win64"
+          release_asset_download "$winarm" ".platform-trust/$winarm"
+
+      - id: verify
+        name: Verify Windows Authenticode trust, versions, and hashes
+        shell: pwsh
+        env:
+          WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          $version = $env:TAG.Substring(1)
+          $win64 = Join-Path $env:GITHUB_WORKSPACE ".platform-trust/echo_${version}_x64-setup.exe"
+          $winarm = Join-Path $env:GITHUB_WORKSPACE ".platform-trust/echo_${version}_arm64-setup.exe"
+          & ./scripts/verify-platform-windows.ps1 -ExpectedPublisher $env:WINDOWS_PUBLISHER -ExpectedVersion $version -ArtifactPath @($win64, $winarm)
+          $x64Hash = (Get-FileHash -LiteralPath $win64 -Algorithm SHA256).Hash.ToLowerInvariant()
+          $arm64Hash = (Get-FileHash -LiteralPath $winarm -Algorithm SHA256).Hash.ToLowerInvariant()
+          "x64_sha256=$x64Hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "arm64_sha256=$arm64Hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  platform_trust:
+    needs: [prepare, reserve, build, verify_updater_trust, verify_macos_platform_trust, verify_windows_platform_trust]
+    if: always() && needs.prepare.outputs.should_build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      updater_evidence: ${{ steps.gate.outputs.updater_evidence }}
+      app_archive_sha256: ${{ steps.gate.outputs.app_archive_sha256 }}
+      dmg_sha256: ${{ steps.gate.outputs.dmg_sha256 }}
+      windows_x64_sha256: ${{ steps.gate.outputs.windows_x64_sha256 }}
+      windows_arm64_sha256: ${{ steps.gate.outputs.windows_arm64_sha256 }}
+    steps:
+      - id: gate
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REQUIRED: ${{ needs.prepare.outputs.requires_platform_trust }}
+          UPDATER_RESULT: ${{ needs.verify_updater_trust.result }}
+          UPDATER_EVIDENCE: ${{ needs.verify_updater_trust.outputs.evidence }}
+          MAC_RESULT: ${{ needs.verify_macos_platform_trust.result }}
+          WINDOWS_RESULT: ${{ needs.verify_windows_platform_trust.result }}
+          MAC_APP_HASH: ${{ needs.verify_macos_platform_trust.outputs.app_archive_sha256 }}
+          MAC_DMG_HASH: ${{ needs.verify_macos_platform_trust.outputs.dmg_sha256 }}
+          WINDOWS_X64_HASH: ${{ needs.verify_windows_platform_trust.outputs.x64_sha256 }}
+          WINDOWS_ARM64_HASH: ${{ needs.verify_windows_platform_trust.outputs.arm64_sha256 }}
+        run: |
+          set -euo pipefail
+          [ "$UPDATER_RESULT" = success ] \
+            || { echo "::error::updater signature trust result is $UPDATER_RESULT"; exit 1; }
+          version="${TAG#v}"
+          expected_mac="echo_aarch64.app.tar.gz"
+          expected_linux="echo_${version}_amd64.AppImage"
+          expected_win64="echo_${version}_x64-setup.exe"
+          expected_winarm="echo_${version}_arm64-setup.exe"
+          jq -e \
+            --arg mac "$expected_mac" --arg linux "$expected_linux" \
+            --arg win64 "$expected_win64" --arg winarm "$expected_winarm" \
+            '(.public_key_sha256 | test("^[0-9a-f]{64}$")) and
+             (.mac.name == $mac and .mac.signed_filename == "echo.app.tar.gz") and
+             (.linux.name == $linux and .linux.signed_filename == $linux) and
+             (.windows_x64.name == $win64 and .windows_x64.signed_filename == $win64) and
+             (.windows_arm64.name == $winarm and .windows_arm64.signed_filename == $winarm) and
+             ([.mac, .linux, .windows_x64, .windows_arm64] | all(
+               (.id | type == "number" and . > 0) and
+               (.sig_id | type == "number" and . > 0) and
+               (.sig_name == (.name + ".sig")) and
+               (.sha256 | test("^[0-9a-f]{64}$")) and
+               (.sig_sha256 | test("^[0-9a-f]{64}$"))))' \
+            <<<"$UPDATER_EVIDENCE" >/dev/null \
+            || { echo "::error::updater verifier returned malformed or mismatched evidence"; exit 1; }
+          echo "updater_evidence=$UPDATER_EVIDENCE" >> "$GITHUB_OUTPUT"
+
+          case "$REQUIRED" in
+            false)
+              echo "0.x release: cryptographic updater gate passed; native platform trust is not required by policy"
+              ;;
+            true)
+              [ "$MAC_RESULT" = success ] \
+                || { echo "::error::macOS platform trust result is $MAC_RESULT"; exit 1; }
+              [ "$WINDOWS_RESULT" = success ] \
+                || { echo "::error::Windows platform trust result is $WINDOWS_RESULT"; exit 1; }
+              for hash in "$MAC_APP_HASH" "$MAC_DMG_HASH" "$WINDOWS_X64_HASH" "$WINDOWS_ARM64_HASH"; do
+                [[ "$hash" =~ ^[0-9a-f]{64}$ ]] \
+                  || { echo "::error::platform trust job returned an invalid SHA-256"; exit 1; }
+              done
+              [ "$(jq -r '.mac.sha256' <<<"$UPDATER_EVIDENCE")" = "$MAC_APP_HASH" ] \
+                || { echo "::error::macOS native and updater checks covered different bytes"; exit 1; }
+              [ "$(jq -r '.windows_x64.sha256' <<<"$UPDATER_EVIDENCE")" = "$WINDOWS_X64_HASH" ] \
+                || { echo "::error::Windows x64 native and updater checks covered different bytes"; exit 1; }
+              [ "$(jq -r '.windows_arm64.sha256' <<<"$UPDATER_EVIDENCE")" = "$WINDOWS_ARM64_HASH" ] \
+                || { echo "::error::Windows ARM64 native and updater checks covered different bytes"; exit 1; }
+              printf 'app_archive_sha256=%s\ndmg_sha256=%s\n' "$MAC_APP_HASH" "$MAC_DMG_HASH" >> "$GITHUB_OUTPUT"
+              printf 'windows_x64_sha256=%s\nwindows_arm64_sha256=%s\n' \
+                "$WINDOWS_X64_HASH" "$WINDOWS_ARM64_HASH" >> "$GITHUB_OUTPUT"
+              echo "v1+ updater and native platform trust gates passed"
+              ;;
+            *)
+              echo "::error::release policy returned invalid requires_platform_trust=$REQUIRED"
+              exit 1
+              ;;
+          esac
+
+  publish:
+    # Atomar: Publish erst nach kryptografischer Updater-Prüfung aller vier
+    # Plattformen und — für v1+ — nativer macOS-/Windows-Verifikation. Alle acht
+    # Updater-Dateien werden unmittelbar vor Publish über ID und SHA-256 gebunden.
+    needs: [prepare, reserve, build, verify_updater_trust, platform_trust]
+    if: needs.prepare.outputs.should_build == 'true' && needs.verify_updater_trust.result == 'success' && needs.platform_trust.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
       contents: write
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Assemble + validate latest.json; publish Stable or retain Draft RC
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRUST_REQUIRED: ${{ needs.prepare.outputs.requires_platform_trust }}
+          UPDATER_EVIDENCE: ${{ needs.verify_updater_trust.outputs.evidence }}
+          VERIFIED_MAC_APP_SHA256: ${{ needs.platform_trust.outputs.app_archive_sha256 }}
+          VERIFIED_MAC_DMG_SHA256: ${{ needs.platform_trust.outputs.dmg_sha256 }}
+          VERIFIED_WINDOWS_X64_SHA256: ${{ needs.platform_trust.outputs.windows_x64_sha256 }}
+          VERIFIED_WINDOWS_ARM64_SHA256: ${{ needs.platform_trust.outputs.windows_arm64_sha256 }}
         run: |
           set -euo pipefail
           tag="${{ needs.prepare.outputs.tag }}"
@@ -487,56 +783,84 @@ jobs:
           repo="${{ github.repository }}"
           now="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
           base_url="https://github.com/$repo/releases/download/$tag"
+          source scripts/release-assets.sh
+          release_assets_load "$repo" "$id" "$tag" "$prerelease"
 
-          rel=$(gh api "repos/$repo/releases/$id")
-          if [ "$(echo "$rel" | jq -r '.tag_name')" != "$tag" ] \
-             || [ "$(echo "$rel" | jq -r '.draft')" != true ] \
-             || [ "$(echo "$rel" | jq -r '.prerelease')" != "$prerelease" ]; then
-            echo "::error::release $id no longer matches canonical draft $tag"
-            exit 1
-          fi
+          verify_hash() {
+            local path="$1" expected="$2" label="$3"
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]] \
+              || { echo "::error::missing verified SHA-256 for $label"; exit 1; }
+            [ "$(sha256sum "$path" | awk '{print $1}')" = "$expected" ] \
+              || { echo "::error::$label changed after trust verification"; exit 1; }
+          }
 
-          exact_count=$(gh api --paginate --slurp "repos/$repo/releases?per_page=100" \
-            | jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | length')
-          if [ "$exact_count" -ne 1 ]; then
-            echo "::error::$tag has $exact_count releases; refusing ambiguous publish"
-            exit 1
-          fi
+          verify_uploaded_manifest_id() {
+            local release_json="$1" expected_id="$2"
+            local count actual_id
+            count=$(jq '[.assets[] | select(.name == "latest.json")] | length' <<<"$release_json")
+            if [ "$count" -ne 1 ]; then
+              echo "::error::expected exactly one final latest.json, found $count"
+              return 1
+            fi
+            actual_id=$(jq -r '.assets[] | select(.name == "latest.json") | .id' <<<"$release_json")
+            if [ "$actual_id" != "$expected_id" ]; then
+              echo "::error::latest.json was replaced after numeric release upload"
+              return 1
+            fi
+          }
 
-          # Dateinamen aus den ECHTEN Assets ableiten (nicht aus dem Tag): der
-          # Installer-Name traegt die App-Version, die bei echten Releases == Tag ist,
-          # bei Test-Tags (…-citest) aber abweicht. So bricht Publish nie am Tag, und
-          # die Manifest-Version stammt garantiert vom gebauten Artefakt.
-          assets=$(echo "$rel" | jq -r '.assets[].name')
-          have() { echo "$assets" | grep -qx "$1"; }
+          ver="${tag#v}"
           mac="echo_aarch64.app.tar.gz"
-          lin=$(echo "$assets"   | grep -E '^echo_.+_amd64\.AppImage$'  | head -1 || true)
-          win64=$(echo "$assets" | grep -E '^echo_.+_x64-setup\.exe$'   | head -1 || true)
-          winarm=$(echo "$assets"| grep -E '^echo_.+_arm64-setup\.exe$' | head -1 || true)
-          missing=""
-          for pair in "macOS=$mac" "Linux=$lin" "Win-x64=$win64" "Win-ARM=$winarm"; do
-            lbl="${pair%%=*}"; f="${pair#*=}"
-            if [ -z "$f" ]; then missing="$missing ${lbl}-installer"; continue; fi
-            have "$f"     || missing="$missing $f"
-            have "$f.sig" || missing="$missing $f.sig"
-          done
-          ver=$(printf '%s' "$lin" | sed -E 's/^echo_(.+)_amd64\.AppImage$/\1/')
-          if [ -n "$missing" ]; then
-            echo "::error::latest.json would be incomplete — missing:$missing"
-            echo "::error::leaving draft hidden; rerun the failed build job(s)."
-            exit 1
-          fi
+          dmg="echo_${ver}_aarch64.dmg"
+          lin="echo_${ver}_amd64.AppImage"
+          win64="echo_${ver}_x64-setup.exe"
+          winarm="echo_${ver}_arm64-setup.exe"
+          trust_dir=$(mktemp -d "${RUNNER_TEMP}/echo-trust-recheck.XXXXXX")
 
-          for f in "$mac" "$lin" "$win64" "$winarm"; do
-            gh release download "$tag" -R "$repo" -p "$f.sig" -O "/tmp/$f.sig" --clobber
+          for spec in "mac:$mac" "linux:$lin" "windows_x64:$win64" "windows_arm64:$winarm"; do
+            key="${spec%%:*}"
+            name="${spec#*:}"
+            expected_name=$(jq -r --arg key "$key" '.[$key].name // empty' <<<"$UPDATER_EVIDENCE")
+            expected_id=$(jq -r --arg key "$key" '.[$key].id // empty' <<<"$UPDATER_EVIDENCE")
+            expected_hash=$(jq -r --arg key "$key" '.[$key].sha256 // empty' <<<"$UPDATER_EVIDENCE")
+            expected_sig_id=$(jq -r --arg key "$key" '.[$key].sig_id // empty' <<<"$UPDATER_EVIDENCE")
+            expected_sig_hash=$(jq -r --arg key "$key" '.[$key].sig_sha256 // empty' <<<"$UPDATER_EVIDENCE")
+            [ "$expected_name" = "$name" ] \
+              || { echo "::error::updater evidence name mismatch for $key"; exit 1; }
+            release_asset_download "$name" "$trust_dir/$name"
+            [ "$RELEASE_ASSET_LAST_ID" = "$expected_id" ] \
+              || { echo "::error::$name was replaced after updater verification"; exit 1; }
+            verify_hash "$trust_dir/$name" "$expected_hash" "$name"
+            release_asset_download "$name.sig" "$trust_dir/$name.sig"
+            [ "$RELEASE_ASSET_LAST_ID" = "$expected_sig_id" ] \
+              || { echo "::error::$name.sig was replaced after updater verification"; exit 1; }
+            verify_hash "$trust_dir/$name.sig" "$expected_sig_hash" "$name.sig"
           done
 
-          cat > /tmp/mkmanifest.py <<'PY'
+          case "$TRUST_REQUIRED" in
+            false)
+              echo "0.x release: updater trust is bound; native platform trust is not required by policy"
+              ;;
+            true)
+              release_asset_download "$dmg" "$trust_dir/$dmg"
+              dmg_id="$RELEASE_ASSET_LAST_ID"
+              verify_hash "$trust_dir/$mac" "$VERIFIED_MAC_APP_SHA256" "$mac native trust"
+              verify_hash "$trust_dir/$dmg" "$VERIFIED_MAC_DMG_SHA256" "$dmg"
+              verify_hash "$trust_dir/$win64" "$VERIFIED_WINDOWS_X64_SHA256" "$win64 native trust"
+              verify_hash "$trust_dir/$winarm" "$VERIFIED_WINDOWS_ARM64_SHA256" "$winarm native trust"
+              ;;
+            *)
+              echo "::error::invalid platform trust requirement: $TRUST_REQUIRED"
+              exit 1
+              ;;
+          esac
+
+          cat > "$trust_dir/mkmanifest.py" <<'PY'
           import sys, json
-          ver, now, base = sys.argv[1], sys.argv[2], sys.argv[3]
-          mac, lin, win64, winarm = sys.argv[4:8]
+          ver, now, base, directory = sys.argv[1:5]
+          mac, lin, win64, winarm = sys.argv[5:9]
           def sig(name):
-              with open(f"/tmp/{name}.sig", "r", encoding="utf-8") as fh:
+              with open(f"{directory}/{name}.sig", "r", encoding="utf-8") as fh:
                   return fh.read().strip()
           def url(name): return f"{base}/{name}"
           plats = {}
@@ -552,22 +876,48 @@ jobs:
                      "platforms": plats}, sys.stdout, indent=2)
           PY
 
-          python3 /tmp/mkmanifest.py "$ver" "$now" "$base_url" \
-            "$mac" "$lin" "$win64" "$winarm" > /tmp/latest.json
-          for k in darwin-aarch64 linux-x86_64 windows-x86_64 windows-aarch64; do
-            jq -e ".platforms[\"$k\"].url" /tmp/latest.json >/dev/null \
-              || { echo "::error::latest.json missing $k"; exit 1; }
+          python3 "$trust_dir/mkmanifest.py" "$ver" "$now" "$base_url" "$trust_dir" \
+            "$mac" "$lin" "$win64" "$winarm" > "$trust_dir/latest.json"
+          for key in darwin-aarch64 linux-x86_64 windows-x86_64 windows-aarch64; do
+            jq -e ".platforms[\"$key\"].url" "$trust_dir/latest.json" >/dev/null \
+              || { echo "::error::latest.json missing $key"; exit 1; }
           done
-          echo "manifest platforms:"; jq '.platforms | keys' /tmp/latest.json
 
-          gh release upload "$tag" -R "$repo" /tmp/latest.json --clobber
+          latest_count=$(jq '[.assets[] | select(.name == "latest.json")] | length' <<<"$RELEASE_ASSETS_JSON")
+          [ "$latest_count" -le 1 ] \
+            || { echo "::error::canonical draft has duplicate latest.json assets"; exit 1; }
+          if [ "$latest_count" -eq 1 ]; then
+            latest_id=$(jq -r '.assets[] | select(.name == "latest.json") | .id' <<<"$RELEASE_ASSETS_JSON")
+            gh api -X DELETE "repos/$repo/releases/assets/$latest_id"
+          fi
+          upload_response=$(python3 scripts/upload-release-asset.py \
+            "$repo" "$id" latest.json "$trust_dir/latest.json")
+          uploaded_latest_id=$(jq -er '.id | select(type == "number" and . > 0)' <<<"$upload_response") \
+            || { echo "::error::numeric release upload returned no valid asset id"; exit 1; }
+
+          final=$(gh api "repos/$repo/releases/$id")
+          jq -e --argjson id "$id" --arg tag "$tag" --argjson prerelease "$prerelease" \
+            '.id == $id and .tag_name == $tag and .draft == true and .prerelease == $prerelease' \
+            <<<"$final" >/dev/null \
+            || { echo "::error::release $id changed before final publish decision"; exit 1; }
+          verify_uploaded_manifest_id "$final" "$uploaded_latest_id"
+          for spec in "mac:$mac" "linux:$lin" "windows_x64:$win64" "windows_arm64:$winarm"; do
+            key="${spec%%:*}"; name="${spec#*:}"
+            expected_id=$(jq -r --arg key "$key" '.[$key].id' <<<"$UPDATER_EVIDENCE")
+            expected_sig_id=$(jq -r --arg key "$key" '.[$key].sig_id' <<<"$UPDATER_EVIDENCE")
+            [ "$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .id' <<<"$final")" = "$expected_id" ] \
+              || { echo "::error::$name was replaced after hash verification"; exit 1; }
+            [ "$(jq -r --arg name "$name.sig" '.assets[] | select(.name == $name) | .id' <<<"$final")" = "$expected_sig_id" ] \
+              || { echo "::error::$name.sig was replaced after hash verification"; exit 1; }
+          done
+          if [ "$TRUST_REQUIRED" = true ]; then
+            [ "$(jq -r --arg name "$dmg" '.assets[] | select(.name == $name) | .id' <<<"$final")" = "$dmg_id" ] \
+              || { echo "::error::$dmg was replaced after hash verification"; exit 1; }
+          fi
+
           if [ "$mode" = "draft_rc" ]; then
-            final=$(gh api "repos/$repo/releases/$id")
-            if [ "$(echo "$final" | jq -r '.draft')" != true ] \
-               || [ "$(echo "$final" | jq -r '.prerelease')" != true ]; then
-              echo "::error::RC release $id escaped its draft/prerelease boundary"
-              exit 1
-            fi
+            [ "$(jq -r '.prerelease' <<<"$final")" = true ] \
+              || { echo "::error::RC release $id escaped its draft/prerelease boundary"; exit 1; }
             echo "signed RC $tag retained as private draft (release $id); Latest unchanged"
           else
             gh api -X PATCH "repos/$repo/releases/$id" \
