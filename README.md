@@ -2,9 +2,8 @@
 
 Offizielle Download- und Auto-Update-Distribution für **Echo** (Subunit).
 
-Dieses Repository enthält ausschließlich signierte, kompilierte Installer und das
-Updater-Manifest (`latest.json`). Der Quellcode ist proprietär und nicht Teil
-dieses Repositories.
+Dieses Repository enthält kompilierte Installer und das Updater-Manifest
+(`latest.json`). Der Quellcode ist proprietär und nicht Teil dieses Repositories.
 
 **Downloads:** [Releases](../../releases/latest) — macOS (Apple Silicon), Windows x64, Windows ARM64, Linux x86_64.
 
@@ -28,5 +27,13 @@ und einem exakt passenden Tag wie `v0.5.166-rc.1` gebaut werden. Er bleibt als
 nicht öffentlich gelisteter GitHub-Draft mit gesetztem Prerelease-Merkmal bestehen
 und wird niemals `Latest`. Dadurch kann er von einem Maintainer geprüft und manuell
 installiert werden, ohne reguläre Echo-Installationen zu aktualisieren.
+
+Vor jedem Publish beziehungsweise RC-Abschluss verifiziert der Workflow die vier
+Updater-Artefakte und ihre vier `.sig`-Dateien kryptografisch gegen den Public Key
+der exakt gebauten Echo-Quelle. IDs und SHA-256-Werte aller acht Dateien werden bis
+zur finalen Publish-Entscheidung gebunden. Ab Version 1.0 einschließlich Release
+Candidates kommt die native Plattform-Trust-Prüfung für macOS und Windows hinzu.
+Die öffentlichen Signer-Identitäten, Prüfungen und noch fehlenden externen
+Voraussetzungen stehen in [`docs/PLATFORM-TRUST.md`](docs/PLATFORM-TRUST.md).
 
 © Subunit. Alle Rechte vorbehalten.
