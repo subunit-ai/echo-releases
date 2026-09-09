@@ -87,7 +87,7 @@ class ReleaseWorkflowContract(unittest.TestCase):
         self.assertIn('[ "$UPDATER_RESULT" = success ]', workflow)
         self.assertIn("needs: [prepare, reserve, build, verify_updater_trust, platform_trust]", workflow)
         self.assertIn(
-            "if: needs.prepare.outputs.should_build == 'true' && "
+            "if: always() && needs.prepare.outputs.should_build == 'true' && "
             "needs.verify_updater_trust.result == 'success' && needs.platform_trust.result == 'success'",
             workflow,
         )

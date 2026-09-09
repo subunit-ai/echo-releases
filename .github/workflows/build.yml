@@ -765,7 +765,10 @@ jobs:
     # Plattformen und — für v1+ — nativer macOS-/Windows-Verifikation. Alle acht
     # Updater-Dateien werden unmittelbar vor Publish über ID und SHA-256 gebunden.
     needs: [prepare, reserve, build, verify_updater_trust, platform_trust]
-    if: needs.prepare.outputs.should_build == 'true' && needs.verify_updater_trust.result == 'success' && needs.platform_trust.result == 'success'
+    # `always()` is required here: for 0.x the two native platform-verifier jobs
+    # are intentionally skipped. GitHub otherwise propagates that transitive
+    # skip to this job even though the aggregate platform_trust gate succeeded.
+    if: always() && needs.prepare.outputs.should_build == 'true' && needs.verify_updater_trust.result == 'success' && needs.platform_trust.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
