@@ -490,8 +490,10 @@ jobs:
     needs: [prepare, reserve, build]
     if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
+    # GitHub exposes unpublished draft releases only to push-capable tokens.
+    # The verifier remains read-only; the workflow contract forbids mutations.
     permissions:
-      contents: read
+      contents: write
     outputs:
       evidence: ${{ steps.verify.outputs.evidence }}
     steps:
@@ -586,8 +588,10 @@ jobs:
     needs: [prepare, reserve, build]
     if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.requires_platform_trust == 'true'
     runs-on: macos-14
+    # GitHub exposes unpublished draft releases only to push-capable tokens.
+    # The verifier remains read-only; the workflow contract forbids mutations.
     permissions:
-      contents: read
+      contents: write
     outputs:
       app_archive_sha256: ${{ steps.verify.outputs.app_archive_sha256 }}
       dmg_sha256: ${{ steps.verify.outputs.dmg_sha256 }}
@@ -629,8 +633,10 @@ jobs:
     needs: [prepare, reserve, build]
     if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.requires_platform_trust == 'true'
     runs-on: windows-latest
+    # GitHub exposes unpublished draft releases only to push-capable tokens.
+    # The verifier remains read-only; the workflow contract forbids mutations.
     permissions:
-      contents: read
+      contents: write
     outputs:
       x64_sha256: ${{ steps.verify.outputs.x64_sha256 }}
       arm64_sha256: ${{ steps.verify.outputs.arm64_sha256 }}
