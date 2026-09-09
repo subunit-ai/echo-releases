@@ -45,6 +45,16 @@ def workflow_run_block(after: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def workflow_job_block(job: str) -> str:
+    match = re.search(
+        rf"(?ms)^  {re.escape(job)}:\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        WORKFLOW,
+    )
+    if match is None:
+        raise AssertionError(f"workflow job not found: {job}")
+    return match.group(0)
+
+
 class ReleaseWorkflowContract(unittest.TestCase):
     def assert_v1_trust_chain(self, workflow: str) -> None:
         self.assertIn(
@@ -379,6 +389,43 @@ class ReleaseWorkflowContract(unittest.TestCase):
             self.assertIn(exact_name, WORKFLOW)
         self.assertIn("repos/$RELEASE_ASSETS_REPO/releases/assets/$RELEASE_ASSET_LAST_ID", RELEASE_ASSETS.read_text(encoding="utf-8"))
         self.assertNotIn("grep -E '^echo_.+_x64-setup", WORKFLOW)
+
+    def test_draft_verifiers_have_job_scoped_access_without_mutation_credentials(self) -> None:
+        for job in (
+            "verify_updater_trust",
+            "verify_macos_platform_trust",
+            "verify_windows_platform_trust",
+        ):
+            with self.subTest(job=job):
+                block = workflow_job_block(job)
+                permission = re.search(
+                    r"(?m)^    permissions:\n((?:      [a-z-]+: (?:read|write|none)\n)+)",
+                    block,
+                )
+                self.assertIsNotNone(permission)
+                self.assertEqual(permission.group(1), "      contents: write\n")
+
+                secret_names = set(re.findall(r"secrets\.([A-Z0-9_]+)", block))
+                self.assertLessEqual(
+                    secret_names,
+                    {"GITHUB_TOKEN", "ECHO_TAURI_DEPLOY_KEY"},
+                    f"{job} gained a PAT or unrelated secret",
+                )
+                self.assertIn("GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}", block)
+                for forbidden_write in (
+                    "gh api -X POST",
+                    "gh api -X PATCH",
+                    "gh api -X PUT",
+                    "gh api -X DELETE",
+                    "gh release create",
+                    "gh release edit",
+                    "gh release delete",
+                    "gh release upload",
+                    "upload-release-asset.py",
+                    "tauri-action",
+                    "git push",
+                ):
+                    self.assertNotIn(forbidden_write, block)
 
     def test_updater_gate_binds_four_artifacts_and_four_signatures_for_all_versions(self) -> None:
         self.assertIn("verify_updater_trust:\n    needs: [prepare, reserve, build]", WORKFLOW)
