@@ -346,9 +346,12 @@ jobs:
         if: matrix.platform == 'windows-11-arm'
         shell: pwsh
         run: |
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/LLVM-19.1.5-woa64.exe"
+          # MSVC 14.51 (VS 18 im Runner-Image) lehnt Clang < 20 per STL1000 ab.
+          # 20.1.8 = dieselbe Version, mit der der x64-Job baut.
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-woa64.exe"
           Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm-arm64.exe"
           Start-Process -FilePath "$env:RUNNER_TEMP\llvm-arm64.exe" -ArgumentList '/S' -Wait
+          & "C:\Program Files\LLVM\bin\clang-cl.exe" --version
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
           "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           choco install cmake ninja --no-progress -y --installargs 'ADD_CMAKE_TO_PATH=System'
