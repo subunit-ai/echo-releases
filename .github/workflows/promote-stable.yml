@@ -1,0 +1,253 @@
+name: Promote held Stable (same bytes)
+
+# Manual final step only after independent review/native acceptance; no build/tag.
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: "Reviewed numeric held draft ID"
+        required: true
+      source_commit:
+        description: "Reviewed exact 40-character private source commit"
+        required: true
+      release_tag:
+        description: "Explicit suffixless stable vX.Y.Z label"
+        required: true
+      receipt_sha256:
+        description: "Independently reviewed SHA256 of held-stable-receipt.json"
+        required: true
+
+permissions:
+  contents: read
+concurrency:
+  group: echo-release-build
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      requires_platform_trust: ${{ steps.policy.outputs.requires_platform_trust }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - id: policy
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TAG: ${{ inputs.release_tag }}
+        run: bash scripts/release_policy.sh workflow_dispatch "$SOURCE_COMMIT" "$TAG" draft_stable >> "$GITHUB_OUTPUT"
+      - name: Checkout exact private source and assert version
+        env:
+          DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          bash scripts/release_policy.sh workflow_dispatch "$SOURCE_COMMIT" "$TAG" draft_stable
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/echo_ci
+          chmod 600 ~/.ssh/echo_ci
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git init _source
+          git -C _source remote add origin git@github.com:subunit-ai/echo-tauri.git
+          git -C _source fetch --depth 1 origin "$SOURCE_COMMIT"
+          git -C _source checkout --detach FETCH_HEAD
+          rm -f ~/.ssh/echo_ci
+          [ "$(git -C _source rev-parse HEAD)" = "$SOURCE_COMMIT" ]
+          python3 - "$TAG" <<'PYTHON'
+          import json, pathlib, sys, tomllib
+          root=pathlib.Path('_source'); expected=sys.argv[1][1:]
+          versions=[json.loads((root/p).read_text())['version'] for p in
+                    ('package.json','package-lock.json','src-tauri/tauri.conf.json')]
+          versions.append(json.loads((root/'package-lock.json').read_text())['packages']['']['version'])
+          versions.append(tomllib.loads((root/'src-tauri/Cargo.toml').read_text())['package']['version'])
+          assert all(v == expected for v in versions), 'source version mismatch'
+          PYTHON
+      - name: Reverify held draft without any asset writes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TAG: ${{ inputs.release_tag }}
+          RECEIPT_SHA256: ${{ inputs.receipt_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 scripts/held-stable.py verify --repo "$REPO" --release-id "$RELEASE_ID" \
+            --source-commit "$SOURCE_COMMIT" --tag "$TAG" --receipt-sha256 "$RECEIPT_SHA256" \
+            --config _source/src-tauri/tauri.conf.json --directory "${RUNNER_TEMP}/held-stable-verify"
+
+  verify_macos_platform_trust:
+    needs: proof
+    if: needs.proof.outputs.requires_platform_trust == 'true'
+    runs-on: macos-14
+    # GitHub exposes unpublished draft releases only to push-capable tokens.
+    # The verifier remains read-only; the workflow contract forbids mutations.
+    permissions:
+      contents: write
+    outputs:
+      app_archive_sha256: ${{ steps.verify.outputs.app_archive_sha256 }}
+      dmg_sha256: ${{ steps.verify.outputs.dmg_sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - id: verify
+        name: Download and verify canonical macOS artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          TAG: ${{ inputs.release_tag }}
+          PRERELEASE: "false"
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_SIGNING_AUTHORITY: ${{ vars.APPLE_SIGNING_AUTHORITY }}
+        run: |
+          set -euo pipefail
+          [ -n "$APPLE_TEAM_ID" ] || { echo "::error::repository variable APPLE_TEAM_ID is required for v1+"; exit 1; }
+          [ -n "$APPLE_SIGNING_AUTHORITY" ] || { echo "::error::repository variable APPLE_SIGNING_AUTHORITY is required for v1+"; exit 1; }
+          source scripts/release-assets.sh
+          release_assets_load "$REPO" "$RELEASE_ID" "$TAG" "$PRERELEASE"
+
+          work_dir=$(mktemp -d "${RUNNER_TEMP}/echo-macos-download.XXXXXX")
+          version="${TAG#v}"
+          app_archive="echo_aarch64.app.tar.gz"
+          dmg="echo_${version}_aarch64.dmg"
+          release_asset_download "$app_archive" "$work_dir/$app_archive"
+          release_asset_download "$dmg" "$work_dir/$dmg"
+          bash scripts/verify-platform-macos.sh \
+            "$work_dir/$app_archive" "$work_dir/$dmg" \
+            "ai.subunit.echo" "$version" "$APPLE_TEAM_ID" "$APPLE_SIGNING_AUTHORITY"
+          printf 'app_archive_sha256=%s\n' "$(shasum -a 256 "$work_dir/$app_archive" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          printf 'dmg_sha256=%s\n' "$(shasum -a 256 "$work_dir/$dmg" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+
+  verify_windows_platform_trust:
+    needs: proof
+    if: needs.proof.outputs.requires_platform_trust == 'true'
+    runs-on: windows-latest
+    # GitHub exposes unpublished draft releases only to push-capable tokens.
+    # The verifier remains read-only; the workflow contract forbids mutations.
+    permissions:
+      contents: write
+    outputs:
+      x64_sha256: ${{ steps.verify.outputs.x64_sha256 }}
+      arm64_sha256: ${{ steps.verify.outputs.arm64_sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Download exact artifacts from canonical draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          TAG: ${{ inputs.release_tag }}
+          PRERELEASE: "false"
+          WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+        run: |
+          set -euo pipefail
+          [ -n "$WINDOWS_PUBLISHER" ] || { echo "::error::repository variable WINDOWS_PUBLISHER is required for v1+"; exit 1; }
+          source scripts/release-assets.sh
+          release_assets_load "$REPO" "$RELEASE_ID" "$TAG" "$PRERELEASE"
+
+          mkdir .platform-trust
+          version="${TAG#v}"
+          win64="echo_${version}_x64-setup.exe"
+          winarm="echo_${version}_arm64-setup.exe"
+          release_asset_download "$win64" ".platform-trust/$win64"
+          release_asset_download "$winarm" ".platform-trust/$winarm"
+
+      - id: verify
+        name: Verify Windows Authenticode trust, versions, and hashes
+        shell: pwsh
+        env:
+          WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          $version = $env:TAG.Substring(1)
+          $win64 = Join-Path $env:GITHUB_WORKSPACE ".platform-trust/echo_${version}_x64-setup.exe"
+          $winarm = Join-Path $env:GITHUB_WORKSPACE ".platform-trust/echo_${version}_arm64-setup.exe"
+          & ./scripts/verify-platform-windows.ps1 -ExpectedPublisher $env:WINDOWS_PUBLISHER -ExpectedVersion $version -ArtifactPath @($win64, $winarm)
+          $x64Hash = (Get-FileHash -LiteralPath $win64 -Algorithm SHA256).Hash.ToLowerInvariant()
+          $arm64Hash = (Get-FileHash -LiteralPath $winarm -Algorithm SHA256).Hash.ToLowerInvariant()
+          "x64_sha256=$x64Hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "arm64_sha256=$arm64Hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+
+  publish:
+    needs: [proof, verify_macos_platform_trust, verify_windows_platform_trust]
+    if: always() && needs.proof.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Require native gates for v1+, compare exact held hashes
+        env:
+          REQUIRED: ${{ needs.proof.outputs.requires_platform_trust }}
+          MAC_RESULT: ${{ needs.verify_macos_platform_trust.result }}
+          WINDOWS_RESULT: ${{ needs.verify_windows_platform_trust.result }}
+          MAC_APP: ${{ needs.verify_macos_platform_trust.outputs.app_archive_sha256 }}
+          MAC_DMG: ${{ needs.verify_macos_platform_trust.outputs.dmg_sha256 }}
+          WIN64: ${{ needs.verify_windows_platform_trust.outputs.x64_sha256 }}
+          WINARM: ${{ needs.verify_windows_platform_trust.outputs.arm64_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ "$REQUIRED" = true ]; then
+            [ "$MAC_RESULT" = success ] && [ "$WINDOWS_RESULT" = success ]
+            for hash in "$MAC_APP" "$MAC_DMG" "$WIN64" "$WINARM"; do
+              [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+            done
+          else
+            [ "$REQUIRED" = false ] && [ "$MAC_RESULT" = skipped ] && [ "$WINDOWS_RESULT" = skipped ]
+          fi
+      - name: Install Minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Checkout exact private source and assert version
+        env:
+          DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          bash scripts/release_policy.sh workflow_dispatch "$SOURCE_COMMIT" "$TAG" draft_stable
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/echo_ci
+          chmod 600 ~/.ssh/echo_ci
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git init _source
+          git -C _source remote add origin git@github.com:subunit-ai/echo-tauri.git
+          git -C _source fetch --depth 1 origin "$SOURCE_COMMIT"
+          git -C _source checkout --detach FETCH_HEAD
+          rm -f ~/.ssh/echo_ci
+          [ "$(git -C _source rev-parse HEAD)" = "$SOURCE_COMMIT" ]
+          python3 - "$TAG" <<'PYTHON'
+          import json, pathlib, sys, tomllib
+          root=pathlib.Path('_source'); expected=sys.argv[1][1:]
+          versions=[json.loads((root/p).read_text())['version'] for p in
+                    ('package.json','package-lock.json','src-tauri/tauri.conf.json')]
+          versions.append(json.loads((root/'package-lock.json').read_text())['packages']['']['version'])
+          versions.append(tomllib.loads((root/'src-tauri/Cargo.toml').read_text())['package']['version'])
+          assert all(v == expected for v in versions), 'source version mismatch'
+          PYTHON
+      - name: Reverify held draft without any asset writes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TAG: ${{ inputs.release_tag }}
+          NATIVE_MAC_APP: ${{ needs.verify_macos_platform_trust.outputs.app_archive_sha256 }}
+          NATIVE_MAC_DMG: ${{ needs.verify_macos_platform_trust.outputs.dmg_sha256 }}
+          NATIVE_WIN64: ${{ needs.verify_windows_platform_trust.outputs.x64_sha256 }}
+          NATIVE_WINARM: ${{ needs.verify_windows_platform_trust.outputs.arm64_sha256 }}
+          RECEIPT_SHA256: ${{ inputs.receipt_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 scripts/held-stable.py publish --repo "$REPO" --release-id "$RELEASE_ID" \
+            --source-commit "$SOURCE_COMMIT" --tag "$TAG" --receipt-sha256 "$RECEIPT_SHA256" \
+            --config _source/src-tauri/tauri.conf.json --directory "${RUNNER_TEMP}/held-stable-publish"

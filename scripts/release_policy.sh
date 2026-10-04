@@ -30,6 +30,12 @@ case "$mode" in
     fi
     prerelease=false
     ;;
+  draft_stable)
+    [ "$event" = workflow_dispatch ] || { echo "::error::draft_stable is manual only" >&2; exit 1; }
+    [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::draft_stable requires exact source SHA" >&2; exit 1; }
+    [[ "$tag" =~ $stable_re ]] || { echo "::error::draft_stable requires explicit stable tag" >&2; exit 1; }
+    prerelease=false
+    ;;
   draft_rc)
     if [ "$event" != "workflow_dispatch" ]; then
       echo "::error::draft_rc is allowed only via manual workflow_dispatch" >&2
@@ -51,7 +57,7 @@ case "$mode" in
     ;;
 esac
 
-source_version="${ref#v}"
+source_version="${tag#v}"
 source_major="${source_version%%.*}"
 requires_platform_trust=false
 if [ "$source_major" != "0" ]; then

@@ -21,19 +21,20 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: "echo-tauri Tag/Ref zum Bauen (z. B. v0.5.166-rc.1)"
+        description: "Source tag; draft_stable requires exact 40-character source commit"
         required: true
       release_tag:
         description: "Release-Label hier in echo-releases (leer = wie source_ref)"
         required: false
       release_mode:
-        description: "Stable veröffentlichen oder signierten RC als privaten Draft behalten"
+        description: "Publish stable, or hold signed RC/stable draft without changing Latest"
         required: true
         default: stable
         type: choice
         options:
           - stable
           - draft_rc
+          - draft_stable
   repository_dispatch:
     types: [build-release]
 
@@ -103,6 +104,10 @@ jobs:
             if [ "$(gh release view "$ref" -R "$THIS_REPO" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)" = "false" ]; then
               echo "$ref ist bereits published — No-op"; echo "should_build=false" >> "$GITHUB_OUTPUT"; exit 0
             fi
+            if gh release view "$ref" -R "$THIS_REPO" --json body --jq '.body' 2>/dev/null | grep -Fq ECHO_HELD_STABLE_V1; then
+              echo "$ref is a held Stable draft — poller No-op; manual promotion only"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
             tag="$ref"; mode=stable; echo "neuer Stable-Tag $ref → wird gebaut"
           elif [ "$EV" = "repository_dispatch" ]; then
             ref="$DISPATCH_REF"; tag="${DISPATCH_TAG:-$DISPATCH_REF}"; mode="${DISPATCH_MODE:-stable}"
@@ -131,6 +136,10 @@ jobs:
           REF: ${{ steps.pick.outputs.ref }}
         run: |
           set -euo pipefail
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit=$REF" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           mkdir -p ~/.ssh
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/echo_ci
           chmod 600 ~/.ssh/echo_ci
@@ -168,6 +177,7 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          MODE: ${{ needs.prepare.outputs.release_mode }}
         run: |
           set -euo pipefail
 
@@ -203,6 +213,10 @@ jobs:
               echo "::error::$TAG ist bereits veröffentlicht; ein veröffentlichter Release wird nie überschrieben."
               exit 1
             fi
+            if printf '%s' "$release" | jq -e '(.body // "") | contains("ECHO_HELD_STABLE_V1")' >/dev/null; then
+              echo "::error::held stable draft cannot be rebuilt or published; use reviewed promotion"; exit 1
+            fi
+            [ "$MODE" != draft_stable ] || { echo "::error::draft_stable requires a fresh release label"; exit 1; }
             id=$(printf '%s' "$release" | jq -r '.id')
             # Ein alter Draft darf wiederaufgenommen werden, wird aber schon vor
             # dem Build auf den explizit gewählten Kanal normalisiert.
@@ -215,6 +229,7 @@ jobs:
           else
             release=$(gh api -X POST "repos/$REPO/releases" \
               -f tag_name="$TAG" -f name="Echo $TAG" \
+              -f body="$([ "$MODE" = draft_stable ] && echo ECHO_HELD_STABLE_V1 || true)" \
               -F draft=true -F prerelease="$PRERELEASE")
             id=$(printf '%s' "$release" | jq -r '.id // empty')
             if [ -z "$id" ]; then
@@ -291,13 +306,21 @@ jobs:
           DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
           REF: ${{ needs.prepare.outputs.ref }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -eu
           mkdir -p ~/.ssh
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/echo_ci
           chmod 600 ~/.ssh/echo_ci
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
-          git clone --depth 1 --branch "$REF" "git@github.com:subunit-ai/echo-tauri.git" .
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            git init .
+            git remote add origin "git@github.com:$SOURCE_REPO.git"
+            git fetch --depth 1 origin "$SOURCE_COMMIT"
+            git checkout --detach FETCH_HEAD
+          else
+            git clone --depth 1 --branch "$REF" "git@github.com:subunit-ai/echo-tauri.git" .
+          fi
           git config --unset-all core.sshCommand 2>/dev/null || true
           rm -f ~/.ssh/echo_ci
           [ "$(git rev-parse HEAD)" = "$SOURCE_COMMIT" ] \
@@ -384,16 +407,16 @@ jobs:
         with:
           targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin' || '' }}
 
-      - name: Verify source tag matches every app version
+      - name: Verify release label matches every app version
         shell: bash
         env:
-          REF: ${{ needs.prepare.outputs.ref }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           node <<'NODE'
           const fs = require("fs");
           const { execFileSync } = require("child_process");
-          const expected = process.env.REF.slice(1);
+          const expected = process.env.TAG.slice(1);
           const packageVersion = JSON.parse(
             fs.readFileSync("package.json", "utf8")
           ).version;
@@ -513,17 +536,25 @@ jobs:
           DEPLOY_KEY: ${{ secrets.ECHO_TAURI_DEPLOY_KEY }}
           REF: ${{ needs.prepare.outputs.ref }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/echo_ci
           chmod 600 ~/.ssh/echo_ci
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/echo_ci -o StrictHostKeyChecking=accept-new"
-          git clone --depth 1 --branch "$REF" "git@github.com:$SOURCE_REPO.git" _source
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            git init _source
+            git -C _source remote add origin "git@github.com:$SOURCE_REPO.git"
+            git -C _source fetch --depth 1 origin "$SOURCE_COMMIT"
+            git -C _source checkout --detach FETCH_HEAD
+          else
+            git clone --depth 1 --branch "$REF" "git@github.com:$SOURCE_REPO.git" _source
+          fi
           rm -f ~/.ssh/echo_ci
           [ "$(git -C _source rev-parse HEAD)" = "$SOURCE_COMMIT" ] \
             || { echo "::error::source tag moved after prepare"; exit 1; }
-          expected="${REF#v}"
+          expected="${TAG#v}"
           actual=$(jq -r '.version // empty' _source/src-tauri/tauri.conf.json)
           [ "$actual" = "$expected" ] \
             || { echo "::error::built updater config version=$actual, expected $expected"; exit 1; }
@@ -927,7 +958,13 @@ jobs:
               || { echo "::error::$dmg was replaced after hash verification"; exit 1; }
           fi
 
-          if [ "$mode" = "draft_rc" ]; then
+          if [ "$mode" = "draft_stable" ]; then
+            python3 scripts/held-stable.py seal \
+              --repo "$repo" --release-id "$id" --source-commit "${{ needs.prepare.outputs.source_commit }}" \
+              --tag "$tag" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" \
+              --updater-evidence "$UPDATER_EVIDENCE" --directory "$trust_dir"
+            echo "signed Stable $tag retained as private draft (release $id); Latest unchanged"
+          elif [ "$mode" = "draft_rc" ]; then
             [ "$(jq -r '.prerelease' <<<"$final")" = true ] \
               || { echo "::error::RC release $id escaped its draft/prerelease boundary"; exit 1; }
             echo "signed RC $tag retained as private draft (release $id); Latest unchanged"
