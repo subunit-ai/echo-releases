@@ -37,3 +37,31 @@ Die öffentlichen Signer-Identitäten, Prüfungen und noch fehlenden externen
 Voraussetzungen stehen in [`docs/PLATFORM-TRUST.md`](docs/PLATFORM-TRUST.md).
 
 © Subunit. Alle Rechte vorbehalten.
+
+### Held Stable acceptance build (same-byte promotion)
+
+A manual `build.yml` run with `release_mode=draft_stable` takes an **exact private
+source commit SHA** and an explicit suffixless `release_tag`, for example
+`v0.6.11`. Do not create that tag in the private source repository beforehand.
+All app versions must already match the label. The existing four-platform build,
+updater signatures and version-dependent native trust gates still apply. The
+result remains `draft=true`, `prerelease=false`; GitHub Latest stays unchanged.
+For 0.x, this means verified updater signatures, **not** a claim of Apple
+notarization or Windows Authenticode.
+
+The fresh draft receives an `ECHO_HELD_STABLE_V1` marker before any build. Its
+assets cannot be rebuilt through another build run; both the poller and normal
+stable mode refuse to publish it. A failed held build stays held for review.
+The private tag poller does not discover tags created in this public repository.
+
+After all build jobs succeed, record the numeric draft ID, exact source SHA and
+independently read back the SHA-256 of `held-stable-receipt.json`. This receipt
+pins the build run/attempt, workflow revision, complete asset IDs/sizes/hashes,
+source and updater public key. Native device acceptance must use those exact
+held binaries. **Only after explicit release approval**, manually dispatch
+`promote-stable.yml` with those pins and the same version label. It independently
+checks the completed canonical four-platform build, all asset bytes, IDs,
+manifest and four cryptographic signatures; v1+ also repeats the native trust
+gates. It publishes the same files without rebuilding, replacing or uploading
+any assets. Create the matching private source tag only after published-release
+readback succeeds; the poller will then see the existing release and do nothing.
